@@ -40,6 +40,63 @@
 | `crystal_sphere_click_cell(x, y)` | Crystal Sphere | Click a hidden cell in the grid |
 | `crystal_sphere_proceed()` | Crystal Sphere | Continue after the minigame finishes |
 
+## Fast CLI Adapter
+
+For agent-driven play, prefer the repo-local fast CLI when you want fewer model
+round trips than the one-tool-per-action MCP layer. It still talks to the same
+local HTTP server, but it batches deterministic work, drains no-decision
+screens, resolves shifted card indexes locally, and writes JSONL timing logs.
+
+Run from the repository root:
+
+```bash
+uv run --directory mcp python sts2_fast_cli.py state --drain
+```
+
+Common commands:
+
+```bash
+# Print concise state; claim gold/single treasure/proceed and single-node maps first.
+uv run --directory mcp python sts2_fast_cli.py state --drain
+
+# Execute a fused deterministic turn plan.
+uv run --directory mcp python sts2_fast_cli.py act '[{"play":"Shrug It Off+"},{"play":"Uppercut+","target":"first"},{"end_turn":true}]' --drain
+
+# Play cards by name; the CLI re-resolves indexes after each play.
+uv run --directory mcp python sts2_fast_cli.py cards "Strike" "Flame Barrier+" "Twin Strike" --target first --end-turn --max-polls 80
+
+# Analyze timing for one slice, fight, or act.
+uv run --directory mcp python sts2_fast_cli.py analyze-log ../logs/sts2-fast/<timestamp>.jsonl
+uv run --directory mcp python sts2_fast_cli.py analyze-log '../logs/sts2-fast/act2-fight-01-*.jsonl'
+```
+
+By default logs are written to repo-root `logs/sts2-fast/<timestamp>.jsonl`;
+pass `--log <path>` before the subcommand to pin a log path. With the
+`uv --directory mcp` commands above, relative pinned paths are resolved from the
+`mcp/` directory, so use `--log ../logs/sts2-fast/<slice>.jsonl`. Use the MCP
+tools when you need a single fine-grained operation; use the CLI for the common
+gameplay loop. Draining treats maps with exactly one next node as no-decision
+states and waits for the resulting combat/event/screen to be ready.
+
+The JSONL log is meant to be analysis-ready. In addition to HTTP timing, it
+records `planned_action`, `action_result`, `drain_action`, `drain_result`, and
+`state_result` events. Result events include compact before/after state digests,
+gameplay deltas, and the next decision point. `analyze-log` summarizes event
+kinds, HTTP time by action, wait reasons, state transitions, deduped after-state
+decision points, raw decision-point event counts, player HP/gold deltas, and
+enemy HP/block removed. For multi-file summaries, `active_wall_time_ms` sums
+per-command time while `wall_time_ms` includes gaps between log files. The
+`command_timing.inter_command_gaps` block estimates Codex-side time between all
+CLI commands: reading state, deciding the next plan, and issuing the next
+command. `command_timing.next_post_gaps` narrows that to post-bearing commands:
+`command_start` measures from the end of one mutating CLI run to the start of
+the next mutating CLI run, and `first_post` includes the new run's local
+preflight time before its first POST. Wait events include elapsed milliseconds
+on new logs, so summaries can split active CLI time into HTTP time, local
+polling/animation wait time, and everything else.
+For deliberate measurement slices, pin a named path such as
+`--log ../logs/sts2-fast/act2-fight-01.jsonl` and record that path in notes.
+
 ### Profile Tools
 
 `get_profile()` returns the raw active-profile progress summary: character totals, global totals, discoveries, achievements, epochs, and aggregate stats.

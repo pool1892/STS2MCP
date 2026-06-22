@@ -16,6 +16,11 @@
 - Rest sites: `rest_choose_option`, then `proceed_to_map`.
 - Rewards: claim from right-to-left (highest index first) to avoid index shifting. Card rewards open a sub-screen; use `rewards_pick_card` or `rewards_skip_card`.
 
+### Gameplay Token Efficiency
+- Always look for no-decision opportunities and remove them from the agent reasoning loop. If a step has only one valid/reasonable outcome, automate it in the CLI/skill/drain layer instead of spending a turn thinking about it.
+- Examples: claiming gold, clicking Proceed, leaving empty reward/rest/treasure screens, taking a single available map node, or fusing deterministic card plays when no target/randomness/ordering decision remains.
+- When a repeated no-decision step is found during play, add or update automation and logging so future runs spend tokens only on real strategic or tactical choices.
+
 ### Potions
 - `use_potion(slot=N)` — slot is the potion slot index, not a card index.
 - `discard_potion(slot=N)` — discard a potion to free up the slot when full.

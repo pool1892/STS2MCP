@@ -1,6 +1,7 @@
 bin/
 obj/
 out/
+logs/
 
 # Python
 __pycache__/
