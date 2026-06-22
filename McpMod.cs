@@ -22,6 +22,10 @@ public static partial class McpMod
     public const string Version = "0.4.0";
     public const int DefaultPort = 15526;
     private const string ConfigFileName = "STS2_MCP.conf";
+    private const int MainThreadReadTimeoutMs = 5000;
+    private const int MainThreadActionTimeoutMs = 10000;
+    private const int RequestBodyTimeoutMs = 5000;
+    private const int MaxRequestBodyChars = 64 * 1024;
 
     private static HttpListener? _listener;
     private static Thread? _serverThread;
@@ -111,6 +115,11 @@ public static partial class McpMod
         }
     }
 
+    private sealed class EndpointModeException : Exception
+    {
+        public EndpointModeException(string message) : base(message) { }
+    }
+
     private static void TryApplyHarmonyPatches()
     {
         try
@@ -137,7 +146,7 @@ public static partial class McpMod
 
     internal static Task<T> RunOnMainThread<T>(Func<T> func)
     {
-        var tcs = new TaskCompletionSource<T>();
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         _mainThreadQueue.Enqueue(() =>
         {
             try { tcs.SetResult(func()); }
@@ -148,13 +157,198 @@ public static partial class McpMod
 
     internal static Task RunOnMainThread(Action action)
     {
-        var tcs = new TaskCompletionSource<bool>();
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _mainThreadQueue.Enqueue(() =>
         {
             try { action(); tcs.SetResult(true); }
             catch (Exception ex) { tcs.SetException(ex); }
         });
         return tcs.Task;
+    }
+
+    private static bool TryRunOnMainThread<T>(
+        Func<T> func,
+        int timeoutMs,
+        out T result,
+        out Exception? error,
+        out bool mayStillBeRunning)
+    {
+        result = default!;
+        error = null;
+        mayStillBeRunning = false;
+
+        var sync = new object();
+        bool started = false;
+        bool cancelledBeforeStart = false;
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        _mainThreadQueue.Enqueue(() =>
+        {
+            lock (sync)
+            {
+                if (cancelledBeforeStart)
+                    return;
+                started = true;
+            }
+
+            try { tcs.TrySetResult(func()); }
+            catch (Exception ex) { tcs.TrySetException(ex); }
+        });
+
+        var completedTask = Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)).GetAwaiter().GetResult();
+        if (!ReferenceEquals(completedTask, tcs.Task))
+        {
+            lock (sync)
+            {
+                if (!started)
+                    cancelledBeforeStart = true;
+                mayStillBeRunning = started;
+            }
+
+            error = new TimeoutException(mayStillBeRunning
+                ? $"Timed out after {timeoutMs} ms waiting for the game main-thread operation to finish."
+                : $"Timed out after {timeoutMs} ms waiting for the game main thread to process the request.");
+            return false;
+        }
+
+        if (tcs.Task.IsFaulted)
+        {
+            error = tcs.Task.Exception?.GetBaseException()
+                ?? new InvalidOperationException("Main-thread operation failed.");
+            return false;
+        }
+
+        if (tcs.Task.IsCanceled)
+        {
+            error = new TaskCanceledException(tcs.Task);
+            return false;
+        }
+
+        result = tcs.Task.Result;
+        return true;
+    }
+
+    private static bool TryReadOnMainThread<T>(
+        HttpListenerResponse response,
+        string operation,
+        Func<T> func,
+        out T result)
+    {
+        return TryRespondFromMainThread(
+            response,
+            operation,
+            func,
+            MainThreadReadTimeoutMs,
+            isSideEffectingAction: false,
+            out result);
+    }
+
+    private static bool TryActionOnMainThread<T>(
+        HttpListenerResponse response,
+        string operation,
+        Func<T> func,
+        out T result)
+    {
+        return TryRespondFromMainThread(
+            response,
+            operation,
+            func,
+            MainThreadActionTimeoutMs,
+            isSideEffectingAction: true,
+            out result);
+    }
+
+    private static bool TryRespondFromMainThread<T>(
+        HttpListenerResponse response,
+        string operation,
+        Func<T> func,
+        int timeoutMs,
+        bool isSideEffectingAction,
+        out T result)
+    {
+        if (TryRunOnMainThread(func, timeoutMs, out result, out var error, out bool mayStillBeRunning))
+            return true;
+
+        error ??= new InvalidOperationException("Main-thread operation failed.");
+        GD.PrintErr($"[STS2 MCP] {operation}: {error}");
+
+        bool isTimeout = error is TimeoutException;
+        bool isEndpointModeError = error is EndpointModeException;
+        response.StatusCode = isTimeout ? 503 : isEndpointModeError ? 409 : 500;
+
+        var body = new Dictionary<string, object?>
+        {
+            ["status"] = "error",
+            ["error"] = isTimeout || isEndpointModeError
+                ? error.Message
+                : $"{operation} failed: {error.Message}",
+            ["detail"] = error.Message,
+            ["retryable"] = isTimeout && (!isSideEffectingAction || !mayStillBeRunning),
+            ["may_have_applied"] = isSideEffectingAction && mayStillBeRunning ? true : null
+        };
+
+        if (!isTimeout && !isEndpointModeError)
+        {
+            body["exception_type"] = error.GetType().FullName;
+            body["stack_trace"] = error.StackTrace;
+        }
+
+        SendJson(response, body);
+        return false;
+    }
+
+    private static void ThrowIfWrongEndpointMode(bool expectedMultiplayer)
+    {
+        bool isMultiplayer = IsMultiplayerRun();
+        if (isMultiplayer == expectedMultiplayer)
+            return;
+
+        throw new EndpointModeException(isMultiplayer
+            ? "Multiplayer run is active. Use /api/v1/multiplayer instead."
+            : "Not in a multiplayer run. Use /api/v1/singleplayer instead.");
+    }
+
+    private static bool TryReadRequestBody(
+        HttpListenerRequest request,
+        HttpListenerResponse response,
+        out string body)
+    {
+        body = "";
+
+        if (request.ContentLength64 > MaxRequestBodyChars)
+        {
+            SendError(response, 413, $"Request body is too large; maximum is {MaxRequestBodyChars} characters.");
+            return false;
+        }
+
+        try
+        {
+            using var reader = new StreamReader(request.InputStream, request.ContentEncoding);
+            using var timeout = new CancellationTokenSource(RequestBodyTimeoutMs);
+            var readTask = reader.ReadToEndAsync(timeout.Token);
+            var completedTask = Task.WhenAny(readTask, Task.Delay(RequestBodyTimeoutMs)).GetAwaiter().GetResult();
+
+            if (!ReferenceEquals(completedTask, readTask))
+            {
+                timeout.Cancel();
+                SendError(response, 408, "Timed out reading request body.");
+                return false;
+            }
+
+            body = readTask.GetAwaiter().GetResult();
+            if (body.Length > MaxRequestBodyChars)
+            {
+                SendError(response, 413, $"Request body is too large; maximum is {MaxRequestBodyChars} characters.");
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            SendError(response, 408, $"Failed to read request body: {ex.Message}");
+            return false;
+        }
     }
 
     private static void ServerLoop()
@@ -169,6 +363,11 @@ public static partial class McpMod
             }
             catch (HttpListenerException) { break; }
             catch (ObjectDisposedException) { break; }
+            catch (Exception ex)
+            {
+                GD.PrintErr($"[STS2 MCP] Server loop error: {ex}");
+                Thread.Sleep(100);
+            }
         }
     }
 
@@ -197,15 +396,6 @@ public static partial class McpMod
             }
             else if (path == "/api/v1/singleplayer")
             {
-                // Hard-block singleplayer endpoint during multiplayer runs
-                // to prevent calling the non-sync-safe end_turn path
-                if (IsMultiplayerRun())
-                {
-                    SendError(response, 409,
-                        "Multiplayer run is active. Use /api/v1/multiplayer instead.");
-                    return;
-                }
-
                 if (request.HttpMethod == "GET")
                     HandleGetState(request, response);
                 else if (request.HttpMethod == "POST")
@@ -215,14 +405,6 @@ public static partial class McpMod
             }
             else if (path == "/api/v1/multiplayer")
             {
-                // Guard: reject multiplayer endpoint during singleplayer runs
-                if (!IsMultiplayerRun())
-                {
-                    SendError(response, 409,
-                        "Not in a multiplayer run. Use /api/v1/singleplayer instead.");
-                    return;
-                }
-
                 if (request.HttpMethod == "GET")
                     HandleGetMultiplayerState(request, response);
                 else if (request.HttpMethod == "POST")
@@ -294,8 +476,12 @@ public static partial class McpMod
 
         try
         {
-            var stateTask = RunOnMainThread(() => BuildMultiplayerGameState());
-            var state = stateTask.GetAwaiter().GetResult();
+            if (!TryReadOnMainThread(response, "Read multiplayer game state", () =>
+                {
+                    ThrowIfWrongEndpointMode(expectedMultiplayer: true);
+                    return BuildMultiplayerGameState();
+                }, out var state))
+                return;
 
             if (format == "markdown")
             {
@@ -326,9 +512,8 @@ public static partial class McpMod
 
     private static void HandlePostMultiplayerAction(HttpListenerRequest request, HttpListenerResponse response)
     {
-        string body;
-        using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
-            body = reader.ReadToEnd();
+        if (!TryReadRequestBody(request, response, out var body))
+            return;
 
         Dictionary<string, JsonElement>? parsed;
         try
@@ -359,8 +544,12 @@ public static partial class McpMod
             {
                 var option = parsed.TryGetValue("option", out var optElem) ? optElem.GetString() ?? "" : "";
                 var seed = parsed.TryGetValue("seed", out var seedElem) ? seedElem.GetString() : null;
-                var resultTask = RunOnMainThread(() => ExecuteMenuSelect(option, seed));
-                var result = resultTask.GetAwaiter().GetResult();
+                if (!TryActionOnMainThread(response, "Execute multiplayer menu action", () =>
+                    {
+                        ThrowIfWrongEndpointMode(expectedMultiplayer: true);
+                        return ExecuteMenuSelect(option, seed);
+                    }, out var result))
+                    return;
                 SendJson(response, result);
             }
             catch (Exception ex)
@@ -372,8 +561,12 @@ public static partial class McpMod
 
         try
         {
-            var resultTask = RunOnMainThread(() => ExecuteMultiplayerAction(action, parsed));
-            var result = resultTask.GetAwaiter().GetResult();
+            if (!TryActionOnMainThread(response, "Execute multiplayer action", () =>
+                {
+                    ThrowIfWrongEndpointMode(expectedMultiplayer: true);
+                    return ExecuteMultiplayerAction(action, parsed);
+                }, out var result))
+                return;
             SendJson(response, result);
         }
         catch (Exception ex)
@@ -388,8 +581,12 @@ public static partial class McpMod
 
         try
         {
-            var stateTask = RunOnMainThread(() => BuildGameState());
-            var state = stateTask.GetAwaiter().GetResult();
+            if (!TryReadOnMainThread(response, "Read game state", () =>
+                {
+                    ThrowIfWrongEndpointMode(expectedMultiplayer: false);
+                    return BuildGameState();
+                }, out var state))
+                return;
 
             if (format == "markdown")
             {
@@ -427,9 +624,8 @@ public static partial class McpMod
 
     private static void HandlePostAction(HttpListenerRequest request, HttpListenerResponse response)
     {
-        string body;
-        using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
-            body = reader.ReadToEnd();
+        if (!TryReadRequestBody(request, response, out var body))
+            return;
 
         Dictionary<string, JsonElement>? parsed;
         try
@@ -457,8 +653,12 @@ public static partial class McpMod
             {
                 var option = parsed.TryGetValue("option", out var optElem) ? optElem.GetString() ?? "" : "";
                 var seed = parsed.TryGetValue("seed", out var seedElem) ? seedElem.GetString() : null;
-                var resultTask = RunOnMainThread(() => ExecuteMenuSelect(option, seed));
-                var result = resultTask.GetAwaiter().GetResult();
+                if (!TryActionOnMainThread(response, "Execute menu action", () =>
+                    {
+                        ThrowIfWrongEndpointMode(expectedMultiplayer: false);
+                        return ExecuteMenuSelect(option, seed);
+                    }, out var result))
+                    return;
                 SendJson(response, result);
             }
             catch (Exception ex)
@@ -470,8 +670,12 @@ public static partial class McpMod
 
         try
         {
-            var resultTask = RunOnMainThread(() => ExecuteAction(action, parsed));
-            var result = resultTask.GetAwaiter().GetResult();
+            if (!TryActionOnMainThread(response, "Execute action", () =>
+                {
+                    ThrowIfWrongEndpointMode(expectedMultiplayer: false);
+                    return ExecuteAction(action, parsed);
+                }, out var result))
+                return;
             SendJson(response, result);
         }
         catch (Exception ex)

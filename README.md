@@ -6,7 +6,7 @@
 
 A mod for [**Slay the Spire 2**](https://store.steampowered.com/app/2868840/Slay_the_Spire_2/) that lets AI agents play the game. Exposes game state and actions via a localhost REST API, with an optional MCP server for Claude Desktop / Claude Code integration.
 
-Singleplayer and multiplayer (co-op) supported, plus full menu and lobby control: profile switching, character select (SP and MP host/client) with optional seed, multiplayer host / Steam-friend join / FastMP localhost join, multiplayer load lobby for resuming saved co-op runs, game-over dismissal, FTUE/tutorial popup handling, and Timeline visibility. Tested against STS2 `v0.103.2`.
+Singleplayer and multiplayer (co-op) supported, plus full menu and lobby control: profile switching, character select (SP and MP host/client) with optional seed, multiplayer host / Steam-friend join / FastMP localhost join, multiplayer load lobby for resuming saved co-op runs, game-over dismissal, FTUE/tutorial popup handling, and Timeline visibility. Tested against STS2 `v0.107.1`.
 
 > [!warning]
 > This mod allows external programs to read and control your game via a localhost API. Use at your own risk with runs you care less about.
@@ -22,7 +22,7 @@ Grab the [latest release](https://github.com/Gennadiyev/STS2MCP/releases/latest)
 
 1. Copy `STS2_MCP.dll` and `STS2_MCP.json` to `<game_install>/mods/`
 2. Launch the game and enable mods in settings (a consent dialog appears on first launch)
-3. The mod starts an HTTP server on `localhost:15526` automatically
+3. The mod starts an HTTP server on `127.0.0.1:15526` and `localhost:15526` automatically
 
 > [!note]
 > The release DLL is a platform-agnostic .NET assembly — the same `STS2_MCP.dll` and `STS2_MCP.json` work on Windows, Linux, and macOS. No separate builds are needed.
@@ -49,13 +49,13 @@ cp STS2_MCP.json "$MODS_DIR/"
 Launch the game and open **Settings → Mods**. The mod should appear in the list. A consent dialog appears on first launch — accept it to enable mod loading. Once enabled, verify the HTTP server is running:
 
 ```bash
-curl -s http://localhost:15526/
+curl -s http://127.0.0.1:15526/
 ```
 
 A successful response looks like:
 
 ```json
-{"message": "Hello from STS2 MCP v0.3.4", "status": "ok"}
+{"message": "Hello from STS2 MCP v0.4.0", "status": "ok"}
 ```
 
 If you get "Connection refused", the mod is not loaded — check that mods are enabled in the game's settings.
@@ -102,7 +102,9 @@ Restart your Claude session after adding the config. To verify the MCP server is
 
 The MCP server accepts `--host` and `--port` options if you need non-default settings.
 
-Flag `--no-trust-env` can be used to disable `requests` from picking up proxy settings from the environment, which can cause connection issues if you are running the server in a container.
+The MCP server ignores proxy environment variables by default because this is a local game-control channel. Pass `--trust-env` only if you intentionally need `HTTP_PROXY`, `HTTPS_PROXY`, or `NO_PROXY` honored.
+
+If you run the MCP server inside a container, `127.0.0.1` points at the container rather than the host game. Use host networking where available, or pass a host-reachable address such as `--host host.docker.internal`.
 
 ### Profile and Compendium Data
 

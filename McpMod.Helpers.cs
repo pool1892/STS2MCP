@@ -123,7 +123,11 @@ public static partial class McpMod
     internal static void SendError(HttpListenerResponse response, int statusCode, string message)
     {
         response.StatusCode = statusCode;
-        SendJson(response, new Dictionary<string, object?> { ["error"] = message });
+        SendJson(response, new Dictionary<string, object?>
+        {
+            ["status"] = "error",
+            ["error"] = message
+        });
     }
 
     private static Dictionary<string, object?> Error(string message)

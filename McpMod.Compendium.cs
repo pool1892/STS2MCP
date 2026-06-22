@@ -23,8 +23,8 @@ public static partial class McpMod
     {
         try
         {
-            var snapshotTask = RunOnMainThread(BuildCompendiumSnapshot);
-            var snapshot = snapshotTask.GetAwaiter().GetResult();
+            if (!TryReadOnMainThread(response, "Build compendium", BuildCompendiumSnapshot, out var snapshot))
+                return;
             SendJson(response, BuildCompendiumResponse(snapshot));
         }
         catch (Exception ex)

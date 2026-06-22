@@ -19,8 +19,9 @@ public static partial class McpMod
     {
         try
         {
-            var dataTask = RunOnMainThread(BuildProfile);
-            SendJson(response, dataTask.GetAwaiter().GetResult());
+            if (!TryReadOnMainThread(response, "Build profile", BuildProfile, out var profile))
+                return;
+            SendJson(response, profile);
         }
         catch (Exception ex)
         {
@@ -32,8 +33,9 @@ public static partial class McpMod
     {
         try
         {
-            var dataTask = RunOnMainThread(BuildProfilesSummary);
-            SendJson(response, dataTask.GetAwaiter().GetResult());
+            if (!TryReadOnMainThread(response, "List profiles", BuildProfilesSummary, out var profiles))
+                return;
+            SendJson(response, profiles);
         }
         catch (Exception ex)
         {
@@ -43,9 +45,8 @@ public static partial class McpMod
 
     private static void HandlePostProfiles(HttpListenerRequest request, HttpListenerResponse response)
     {
-        string body;
-        using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
-            body = reader.ReadToEnd();
+        if (!TryReadRequestBody(request, response, out var body))
+            return;
 
         Dictionary<string, JsonElement>? parsed;
         try
@@ -71,8 +72,9 @@ public static partial class McpMod
 
         try
         {
-            var resultTask = RunOnMainThread(() => ExecuteProfileAction(action, profileId));
-            SendJson(response, resultTask.GetAwaiter().GetResult());
+            if (!TryActionOnMainThread(response, "Execute profile action", () => ExecuteProfileAction(action, profileId), out var result))
+                return;
+            SendJson(response, result);
         }
         catch (Exception ex)
         {

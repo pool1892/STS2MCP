@@ -14,8 +14,8 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("sts2")
 
-_base_url: str = "http://localhost:15526"
-_trust_env: bool = True
+_base_url: str = "http://127.0.0.1:15526"
+_trust_env: bool = False
 _http: httpx.AsyncClient | None = None
 
 
@@ -46,7 +46,10 @@ def _profiles_url() -> str:
 def _get_client() -> httpx.AsyncClient:
     global _http
     if _http is None:
-        _http = httpx.AsyncClient(timeout=httpx.Timeout(10), trust_env=_trust_env)
+        _http = httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=2.0),
+            trust_env=_trust_env,
+        )
     return _http
 
 
@@ -146,10 +149,47 @@ async def _wait_for_profile(profile_id: int, fallback: str) -> str:
 
 
 def _handle_error(e: Exception) -> str:
+    if isinstance(e, httpx.ConnectTimeout):
+        return (
+            f"Error: Timed out connecting to STS2_MCP at {_base_url}. "
+            "Is the game running with the mod enabled?"
+        )
     if isinstance(e, httpx.ConnectError):
-        return "Error: Cannot connect to STS2_MCP mod. Is the game running with the mod enabled?"
+        return (
+            f"Error: Cannot connect to STS2_MCP at {_base_url}. "
+            "Is the game running with the mod enabled?"
+        )
+    if isinstance(e, httpx.ReadTimeout):
+        return (
+            f"Error: STS2_MCP at {_base_url} did not answer before the timeout. "
+            "The game may be loading or blocked on a modal; inspect the game, then retry."
+        )
+    if isinstance(e, httpx.TimeoutException):
+        return f"Error: Request to STS2_MCP at {_base_url} timed out: {e}"
     if isinstance(e, httpx.HTTPStatusError):
-        return f"Error: HTTP {e.response.status_code} — {e.response.text}"
+        response = e.response
+        detail = response.text
+        retryable = None
+        may_have_applied = None
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                detail = str(data.get("error") or data.get("detail") or detail)
+                retryable = data.get("retryable")
+                may_have_applied = data.get("may_have_applied")
+        except json.JSONDecodeError:
+            pass
+
+        message = f"Error: HTTP {response.status_code} from STS2_MCP - {detail}"
+        if response.status_code == 503:
+            message = f"Error: STS2_MCP is temporarily busy - {detail}"
+        if retryable is True:
+            message += " Retry is safe."
+        elif retryable is False:
+            message += " Do not blindly retry; inspect the latest game state first."
+        if may_have_applied:
+            message += " The action may already have reached the game."
+        return message
     return f"Error: {e}"
 
 
@@ -1133,13 +1173,14 @@ async def mp_crystal_sphere_proceed() -> str:
 def main():
     parser = argparse.ArgumentParser(description="STS2 MCP Server")
     parser.add_argument("--port", type=int, default=15526, help="Game HTTP server port")
-    parser.add_argument("--host", type=str, default="localhost", help="Game HTTP server host")
-    parser.add_argument("--no-trust-env", action="store_true", help="Ignore HTTP_PROXY/HTTPS_PROXY environment variables")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Game HTTP server host")
+    parser.add_argument("--trust-env", action="store_true", help="Honor HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment variables")
+    parser.add_argument("--no-trust-env", action="store_true", help="Ignore HTTP_PROXY/HTTPS_PROXY environment variables (default)")
     args = parser.parse_args()
 
     global _base_url, _trust_env
     _base_url = f"http://{args.host}:{args.port}"
-    _trust_env = not args.no_trust_env
+    _trust_env = args.trust_env and not args.no_trust_env
 
     # Eagerly initialize the shared httpx client so the first request is fast
     _get_client()
