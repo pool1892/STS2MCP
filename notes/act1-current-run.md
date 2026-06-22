@@ -1,6 +1,6 @@
 # Act 1 Current-Run Strategy And Tactics
 
-Goal: win Act 1 through the STS2MCP API.
+Goal: win Act 1 through the localhost API and fast CLI.
 
 Date: 2026-06-22
 

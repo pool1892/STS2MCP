@@ -20,5 +20,5 @@ Mod version: [e.g. 0.3.2, a390f1b]
 **Description**
 Concisely summarize the issue you've encountered.
 
-**MCP Client**
-N/A (Raw API calls or does not matter) / Claude Desktop / Cursor / GPT-5.4 via OpenCode / ...
+**Agent / CLI Surface**
+Fast CLI / Raw API calls / Cursor / GPT-5.4 via OpenCode / ...

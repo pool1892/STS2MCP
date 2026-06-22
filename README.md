@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="docs/teaser.png" alt="STS2 MCP" width="90%" />
+  <img src="docs/teaser.png" alt="STS2 fast CLI" width="90%" />
 </p>
 
 <p align="center"><em>An Experimental Research Project to Fully-Automate your Slay the Spire 2 Runs</em></p>
 
-A mod for [**Slay the Spire 2**](https://store.steampowered.com/app/2868840/Slay_the_Spire_2/) that lets AI agents play the game. Exposes game state and actions via a localhost REST API, with an optional MCP server for Claude Desktop / Claude Code integration.
+A mod for [**Slay the Spire 2**](https://store.steampowered.com/app/2868840/Slay_the_Spire_2/) that lets AI agents play the game. Exposes game state and actions via a localhost REST API, with a repo-local fast CLI and gameplay skills for agent-driven runs.
 
 Singleplayer and multiplayer (co-op) supported, plus full menu and lobby control: profile switching, character select (SP and MP host/client) with optional seed, multiplayer host / Steam-friend join / FastMP localhost join, multiplayer load lobby for resuming saved co-op runs, game-over dismissal, FTUE/tutorial popup handling, and Timeline visibility. Tested against STS2 `v0.107.1`.
 
@@ -52,59 +52,42 @@ Launch the game and open **Settings → Mods**. The mod should appear in the lis
 curl -s http://127.0.0.1:15526/
 ```
 
-A successful response looks like:
+A successful response includes an `ok` status, for example:
 
 ```json
-{"message": "Hello from STS2 MCP v0.4.0", "status": "ok"}
+{"status": "ok"}
 ```
 
 If you get "Connection refused", the mod is not loaded — check that mods are enabled in the game's settings.
 
 ### 2. Give Your AI Instructions to Interact with the Game
 
-**Clone or download the repository**, then:
+**Clone or download the repository**, then tell your AI agent to load
+`skills/sts2-play/SKILL.md`. Gameplay in this fork should always go through the
+fast CLI, not a separate tool server.
 
-| I prefer a skill | I prefer an MCP Server |
-|---|---|
-| Tell AI to reference docs/raw-*.md. Sit back, and watch it play. | Requires [Python 3.11+](https://www.python.org/) and [uv](https://docs.astral.sh/uv/). Follow the instructions below ⬇️ |
+#### Fast CLI setup
 
-#### MCP server setup
-
-Install [uv](https://docs.astral.sh/uv/) if you don't have it (macOS: `brew install uv`). Then run the server once to install dependencies:
+Install [uv](https://docs.astral.sh/uv/) if you don't have it (macOS: `brew install uv`). Then run the CLI once to install dependencies:
 
 ```bash
-uv run --directory /path/to/STS2_MCP/mcp python server.py --help
+uv run --directory /path/to/repo/cli python sts2_fast_cli.py --help
 ```
 
-`uv` reads `mcp/pyproject.toml`, creates an isolated virtual environment, and installs the pinned dependencies from `mcp/uv.lock`. Subsequent runs reuse the environment instantly.
+`uv` reads `cli/pyproject.toml`, creates an isolated virtual environment, and installs the pinned dependencies from `cli/uv.lock`. Subsequent runs reuse the environment instantly.
 
-Add the server to your AI client's MCP config:
+Common gameplay commands:
 
-```json
-{
-  "mcpServers": {
-    "sts2": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/STS2_MCP/mcp", "python", "server.py"]
-    }
-  }
-}
+```bash
+uv run --directory cli python sts2_fast_cli.py --compact state --drain
+uv run --directory cli python sts2_fast_cli.py --compact act '[{"play":"Shrug It Off+"},{"play":"Uppercut+","target":"first"},{"end_turn":true}]' --drain --max-polls 80
+uv run --directory cli python sts2_fast_cli.py analyze-log 'logs/sts2-fast/act2-fight-01*.jsonl'
 ```
 
-**Claude Code**: add to your project's `.mcp.json`.
-**Claude Desktop**: add to `claude_desktop_config.json` with the same config as above.
-*Other agents should have similar config options for custom MCP servers.*
-
-> [!tip]
-> On macOS, use the absolute path to `uv` (e.g. `/opt/homebrew/bin/uv`) in the `command` field. GUI-launched apps may not inherit your shell's `PATH`, which would prevent the server from starting.
-
-Restart your Claude session after adding the config. To verify the MCP server is working, ask Claude to call `get_game_state` — with the game running, it should return the current game state.
-
-The MCP server accepts `--host` and `--port` options if you need non-default settings.
-
-The MCP server ignores proxy environment variables by default because this is a local game-control channel. Pass `--trust-env` only if you intentionally need `HTTP_PROXY`, `HTTPS_PROXY`, or `NO_PROXY` honored.
-
-If you run the MCP server inside a container, `127.0.0.1` points at the container rather than the host game. Use host networking where available, or pass a host-reachable address such as `--host host.docker.internal`.
+The CLI accepts `--base-url`, `--timeout`, `--trust-env`, `--log`, and
+`--compact` flags. It talks to the same localhost HTTP API exposed by the game
+mod, batches deterministic actions, drains no-decision screens, polls
+transitions, and writes timing logs.
 
 ### Profile and Compendium Data
 
@@ -116,11 +99,12 @@ The HTTP API exposes profile-level progress separately from live run state:
 - `GET /api/v1/profiles` lists the three profile slots and the active profile.
 - `POST /api/v1/profiles` switches or deletes profile slots through the game UI.
 
-The MCP server exposes the same profile data through `get_profile()`, `get_compendium()`, `search_wiki(query, item_type, limit)`, `list_profiles()`, `switch_profile(profile_id)`, and `delete_profile(profile_id)`.
+The fast CLI and helper scripts should use these localhost HTTP endpoints
+directly when profile data is needed.
 
-`get_compendium()` is intended for agents that need durable context outside the current room or current run. It works from the main menu, includes a `current_run` block while a run is active, and summarizes saved `saves/history/*.run` files for the active profile. Run history is capped to the 20 most recent files in the response so long-lived profiles do not create unbounded tool output.
+`GET /api/v1/compendium` is intended for agents that need durable context outside the current room or current run. It works from the main menu, includes a `current_run` block while a run is active, and summarizes saved `saves/history/*.run` files for the active profile. Run history is capped to the 20 most recent files in the response so long-lived profiles do not create unbounded output.
 
-`search_wiki()` is the selective lookup path for durable card and relic text. It never returns the full game catalog: the mod first filters to the active profile's discovered card and relic IDs, then returns only the best fuzzy matches. Use `item_type="card"` or `item_type="relic"` when the query is known, and raise `limit` only when the default 10 results are not enough.
+`GET /api/v1/wiki?query=...` is the selective lookup path for durable card and relic text. It never returns the full game catalog: the mod first filters to the active profile's discovered card and relic IDs, then returns only the best fuzzy matches. Use `item_type="card"` or `item_type="relic"` when the query is known, and raise `limit` only when the default 10 results are not enough.
 
 ## For Developers
 
@@ -194,7 +178,7 @@ I start building this mod with the hope that I can co-op with an AI player. Sing
 
 First of all, I play lots of games, including service games that has daily/weekly tasks. I really hoped that modern AI could save me from the grind, which, if you have tried one or more of the GUI agents, never really materialized. Let's face it: modern AI is still pretty bad at gaming because no one cares.
 
-About my intention, as a researcher that loves playing games, the purpose of STS2MCP is to test AI models and agents in a rarely explored (we call it out-of-distribution) domain. Ultimately, this might turn into a benchmark for evaluating the reasoning and decision-making capabilities of different language models.
+About my intention, as a researcher that loves playing games, the purpose of this project is to test AI models and agents in a rarely explored (we call it out-of-distribution) domain. Ultimately, this might turn into a benchmark for evaluating the reasoning and decision-making capabilities of different language models.
 
 STS2 is just an example to show how good (or bad) current AI agents are at playing such games. **I have no intention to replace human players with AI, and I would definitely rather play STS2 myself** as a big fan of the game.
 
@@ -204,7 +188,7 @@ It can be, but it doesn't have to be. The mod itself does not alter the gameplay
 
 ### How many tokens do a run consume?
 
-I evaluated on the Ironclad. Claude Sonnet 4.6 uses slightly more than 8M tokens (counting both input, output and tool responses) for a full run. GPT-5.4 averages 7.34M tokens. Depending on your prompt and model choice, it can be more or less.
+I evaluated on the Ironclad. Claude Sonnet 4.6 uses slightly more than 8M tokens for a full run. GPT-5.4 averages 7.34M tokens. Depending on your prompt and model choice, it can be more or less.
 
 ### Do you have a roadmap for future features?
 

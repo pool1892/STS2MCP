@@ -1,20 +1,50 @@
-# STS2 MCP — AI Gameplay Guide
+# STS2 Fast CLI Gameplay Guide
 
-## MCP Tool Calling Tips
+## Primary Gameplay Workflow
+
+For gameplay runs in this fork, use repo-local skills and the fast CLI before
+acting:
+
+- `skills/sts2-play/SKILL.md` for the main play loop.
+- `skills/sts2-strategy/SKILL.md` for combat, route, reward, rest, shop, and
+  event decisions.
+- `skills/sts2-learning-loop/SKILL.md` for run notes, timing friction, and
+  self-improvement observations.
+- `skills/sts2-play/references/http-api.md` for state shape, POST actions, and
+  no-decision drain rules.
+- `skills/sts2-play/references/gameplay-policy.md` for tactical and strategic
+  choices.
+- `skills/sts2-play/references/learning-loop.md` for run notes and
+  self-improvement logging.
+
+This fork intentionally has one agent-control surface: the repo-local CLI at
+`cli/sts2_fast_cli.py`, with the repo-local skills carrying the decision
+policy. Do not start, configure, or call a separate tool server for gameplay.
+Direct localhost HTTP calls are a debugging fallback and the underlying
+contract, not the default agent play surface.
+
+## CLI State Tips
 
 ### State Polling
-- After `combat_end_turn`, the state may show `is_play_phase: false` or `turn: enemy`. Call `get_game_state` again to advance to the next player turn.
-- Sometimes you need to call `get_game_state` twice — once to see enemy turn results, once to see your new hand.
-- Use `format: "json"` during combat for structured data; `format: "markdown"` for map/event overview.
+- After the CLI posts `end_turn`, the game may briefly show
+  `is_play_phase: false` or `turn: enemy`. Let the CLI poll until the next
+  ready player turn or next screen.
+- If debugging with direct HTTP, poll `GET /api/v1/singleplayer?format=json`
+  until the state is ready.
+- Prefer `uv run --directory cli python sts2_fast_cli.py --compact state --drain`
+  for normal play state reads.
+- The underlying structured state is `GET /api/v1/singleplayer?format=json`.
 
 ### Card Index Shifting
 - **CRITICAL**: Playing a card removes it from hand and shifts all indices. Play cards from RIGHT to LEFT (highest index first) to keep lower indices stable, or re-check state between plays.
 - When targeting, always provide `target` for single-target cards. Entity IDs are UPPER_SNAKE_CASE with a `_0` suffix (e.g. `KIN_PRIEST_0`).
 
 ### Event & Reward Flow
-- Events: `event_choose_option`. After choosing, there's often a "Proceed" option at index 0.
-- Rest sites: `rest_choose_option`, then `proceed_to_map`.
-- Rewards: claim from right-to-left (highest index first) to avoid index shifting. Card rewards open a sub-screen; use `rewards_pick_card` or `rewards_skip_card`.
+- Events use the HTTP action `choose_event_option`. After choosing, there is
+  often a Proceed option at index 0; the CLI drain should clear it.
+- Rest sites use `choose_rest_option`, then `proceed` once complete.
+- Rewards use `claim_reward`. Card rewards open a sub-screen; use
+  `select_card_reward` or `skip_card_reward`.
 
 ### Gameplay Token Efficiency
 - Always look for no-decision opportunities and remove them from the agent reasoning loop. If a step has only one valid/reasonable outcome, automate it in the CLI/skill/drain layer instead of spending a turn thinking about it.
@@ -22,8 +52,8 @@
 - When a repeated no-decision step is found during play, add or update automation and logging so future runs spend tokens only on real strategic or tactical choices.
 
 ### Potions
-- `use_potion(slot=N)` — slot is the potion slot index, not a card index.
-- `discard_potion(slot=N)` — discard a potion to free up the slot when full.
+- `use_potion` uses the potion slot index, not a card index.
+- `discard_potion` discards a potion to free up the slot when full.
 - Potions don't cost energy or count as card plays. Use buff potions BEFORE playing cards.
 
 ---

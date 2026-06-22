@@ -1,0 +1,8 @@
+[project]
+name = "sts2-fast-cli"
+version = "0.1.0"
+description = "Fast CLI for Slay the Spire 2 HTTP gameplay automation"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.25.0",
+]

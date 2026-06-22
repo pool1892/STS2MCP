@@ -1,6 +1,6 @@
-# MCP And Game-Interaction Quality Notes
+# HTTP API And Game-Interaction Quality Notes
 
-Purpose: prototype observations about whether STS2MCP exposes enough reliable state and controls for a gameplay self-improvement loop.
+Purpose: prototype observations about whether the localhost API and fast CLI expose enough reliable state and controls for a gameplay self-improvement loop.
 
 ## Baseline Observations
 
@@ -40,5 +40,5 @@ Purpose: prototype observations about whether STS2MCP exposes enough reliable st
 - Shop state can report `can_proceed: false` even though a direct `proceed` action succeeds. Shops should remain explicit decision points while stocked/affordable choices remain, but once the agent has decided to leave it should send `proceed` directly instead of trusting `can_proceed`.
 - Multi-enemy, multi-hit turns can exceed a 30-poll end-turn wait even when the game resolves correctly. `cards --max-polls 80` or `act --max-polls 80` is the safer default for Act 2+ combats with long animations.
 - The timing logs now separate practical latency into HTTP time, wait/poll elapsed time, active CLI wall time, and next-post gaps between mutating commands. For Codex efficiency work, `command_timing.next_post_gaps.first_post` is the most direct measure of "time until the next game-changing POST."
-- Card-selection control names are easy to mix up: the underlying general endpoint is `select_card`, while MCP-style `deck_select_card` is a useful alias for agent ergonomics. Keep aliases close to MCP names where possible.
+- Card-selection control names are easy to mix up: the underlying HTTP action is `select_card`, followed by `confirm_selection` when the selection can be confirmed.
 - Map screens with exactly one available next node contain no strategic choice. The fast loop should auto-select that node during drain and use the map-specific waiter so early combat/event frames do not leak through.

@@ -1,9 +1,8 @@
-"""Fast local CLI for driving STS2_MCP with fewer agent round trips.
+"""Fast local CLI for driving Slay the Spire 2 with fewer agent round trips.
 
-This module intentionally sits beside the MCP server rather than replacing the
-game mod. The mod remains the HTTP adapter; this CLI is a deeper interface for
-agents that want to batch deterministic work, auto-drain no-decision screens,
-and collect timing logs.
+The game mod remains the HTTP adapter; this CLI is the sole agent-control
+surface for this fork. It batches deterministic work, auto-drains no-decision
+screens, polls transitions, and collects timing logs.
 """
 
 from __future__ import annotations
@@ -1721,7 +1720,7 @@ def expand_log_path_args(values: list[str]) -> list[Path]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sts2-fast",
-        description="Fast CLI adapter for STS2_MCP HTTP gameplay automation.",
+        description="Fast CLI adapter for STS2 HTTP gameplay automation.",
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--timeout", type=float, default=20.0)
