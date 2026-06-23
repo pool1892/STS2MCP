@@ -113,7 +113,20 @@ Purpose: prototype observations about whether the localhost API and fast CLI exp
 - Live canaries confirmed this is an intentional API boundary, not a polling
   issue: `menu timeline` returned `manual_action_required`, and `menu advance`
   returned `Unknown menu option`.
-- The CLI should surface this as a manual Timeline reveal requirement before
-  promising that `start-run` can begin from game over. This is exactly the kind
-  of boundary where the agent must ask for the real manual action instead of
-  inventing a fake start path.
+- The CLI now surfaces this as an explicit Timeline reveal requirement and
+  offers two controlled paths: `timeline reveal` or
+  `start-run --auto-reveal-timeline`. Both mark only safe pending `Obtained`
+  epochs as revealed through profile progress instead of opening the fragile
+  Timeline UI state that previously produced invalid unlock-state errors.
+
+## 2026-06-23 ObtainedNoSlot Partial-Reveal Failure
+
+- A fresh `NEOW_EPOCH` appeared as `ObtainedNoSlot`. Marking it `Revealed`
+  without slot/unlock side effects cleared `pending_epoch_ids` but left the main
+  menu with no `singleplayer` button.
+- Live profile inspection showed `discovered_acts: []`. Repairing the inactive
+  profile save to include `ACT.OVERGROWTH`, then switching back to the profile,
+  restored `singleplayer` and allowed a fresh Ironclad run to start.
+- `timeline reveal` now refuses `ObtainedNoSlot` epochs and reports
+  `pending_slot_unlock_epoch_ids` so the CLI cannot create this half-unlocked
+  state again.

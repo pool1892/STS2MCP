@@ -7,7 +7,9 @@ from contextlib import redirect_stdout
 from copy import deepcopy
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
+import sts2_fast_cli as cli_module
 from sts2_fast_cli import (
     DELAYED_CARD_SETTLE_POLLS,
     DEFAULT_INITIAL_POLL_DELAY,
@@ -36,6 +38,7 @@ from sts2_fast_cli import (
     expand_log_path_args,
     normalize_action,
     output_log_path,
+    run,
     start_run,
     next_trivial_action,
     summarize_state,
@@ -1263,6 +1266,114 @@ class FakeGameOverToBlockedTimelineStartRunClient(FakeBlockedTimelineStartRunCli
         return {"status": "error", "manual_action_required": True}
 
 
+class FakeSlotUnlockTimelineStartRunClient(FakeBlockedTimelineStartRunClient):
+    def __init__(self):
+        super().__init__()
+        self.timeline_gets = []
+        self.timeline_posts = []
+
+    def get_json(self, path, *, params=None):
+        self.timeline_gets.append({"path": path, "params": params})
+        if path == "/api/v1/timeline":
+            return {
+                "status": "ok",
+                "pending_epoch_ids": ["NEOW_EPOCH"],
+                "pending_slot_unlock_epoch_ids": ["NEOW_EPOCH"],
+            }
+        return {"status": "error", "error": "unexpected get"}
+
+    def post_json_unchecked(self, path, body):
+        self.timeline_posts.append({"path": path, "body": body})
+        return {"status": "error", "error": "unexpected mutation"}
+
+
+class FakeAutoRevealTimelineStartRunClient(FakeMenuStartRunClient):
+    def __init__(self):
+        super().__init__()
+        self.timeline_posts = []
+        self._state = {
+            "state_type": "menu",
+            "menu_screen": "main",
+            "player": {"potions": []},
+            "options": ["settings", "quit"],
+            "blocked_options": [
+                {
+                    "name": "timeline",
+                    "reason": "manual_epoch_reveal_required",
+                    "pending_epoch_ids": ["epoch_a", "epoch_b"],
+                }
+            ],
+        }
+
+    def post_json(self, path, body):
+        self.timeline_posts.append({"path": path, "body": body})
+        if path == "/api/v1/timeline" and body == {"action": "reveal_pending", "dry_run": False}:
+            self._state = self._main_menu()
+            return {
+                "status": "ok",
+                "pending_epoch_ids": ["epoch_a", "epoch_b"],
+                "revealed_epoch_ids": ["epoch_a", "epoch_b"],
+                "changed": True,
+            }
+        return {"status": "error", "error": "unexpected timeline request"}
+
+
+class FakeStuckTimelineStartRunClient(FakeAutoRevealTimelineStartRunClient):
+    def post_json(self, path, body):
+        self.timeline_posts.append({"path": path, "body": body})
+        if path == "/api/v1/timeline" and body == {"action": "reveal_pending", "dry_run": False}:
+            return {
+                "status": "ok",
+                "pending_epoch_ids": ["epoch_a", "epoch_b"],
+                "revealed_epoch_ids": ["epoch_a", "epoch_b"],
+                "changed": True,
+            }
+        return {"status": "error", "error": "unexpected timeline request"}
+
+
+class FakeTimelineCliClient:
+    def __init__(self):
+        self.gets = []
+        self.posts = []
+
+    def close(self):
+        pass
+
+    def get_json(self, path, *, params=None):
+        self.gets.append({"path": path, "params": params})
+        if path == "/api/v1/timeline":
+            return {"status": "ok", "pending_epoch_ids": ["epoch_a"], "pending_count": 1}
+        return {"status": "error", "error": "unexpected get"}
+
+    def post_json(self, path, body):
+        self.posts.append({"path": path, "body": body})
+        if path == "/api/v1/timeline":
+            return {
+                "status": "ok",
+                "dry_run": body.get("dry_run"),
+                "pending_epoch_ids": ["epoch_a"],
+                "revealed_epoch_ids": [] if body.get("dry_run") else ["epoch_a"],
+            }
+        return {"status": "error", "error": "unexpected post"}
+
+
+class FakeTimelineErrorCliClient(FakeTimelineCliClient):
+    def post_json(self, path, body):
+        raise RuntimeError("validated post_json should not be used for timeline reveal")
+
+    def post_json_unchecked(self, path, body):
+        self.posts.append({"path": path, "body": body})
+        if path == "/api/v1/timeline":
+            return {
+                "status": "error",
+                "error": "Timeline blocker includes epochs in ObtainedNoSlot state",
+                "pending_epoch_ids": ["NEOW_EPOCH"],
+                "pending_slot_unlock_epoch_ids": ["NEOW_EPOCH"],
+                "manual_action_required": True,
+            }
+        return {"status": "error", "error": "unexpected post"}
+
+
 class FakeNoChangeMenuClient:
     def __init__(self):
         self.posts = []
@@ -2291,6 +2402,81 @@ class FastCliTests(unittest.TestCase):
             {"action": "menu_select", "option": "singleplayer"},
         )
 
+    def test_return_to_menu_action_posts_and_waits_for_menu(self):
+        class FakeReturnMenuClient:
+            def __init__(self):
+                self.posts = []
+                self.state_calls = 0
+                self._state = {
+                    "state_type": "monster",
+                    "player": {
+                        "potions": [],
+                        "hand": [{"index": 0, "name": "Strike"}],
+                    },
+                    "battle": {
+                        "turn": "player",
+                        "is_play_phase": True,
+                        "enemies": [{"entity_id": "NIBBIT_0", "hp": 44}],
+                    },
+                }
+                self._states = []
+
+            def state(self):
+                self.state_calls += 1
+                if self._states:
+                    self._state = self._states.pop(0)
+                return self._state
+
+            def post(self, body):
+                self.posts.append(body)
+                if body["action"] == "return_to_menu":
+                    unknown = {"state_type": "unknown", "player": {"potions": []}}
+                    empty_menu = {
+                        "state_type": "menu",
+                        "menu_screen": "main",
+                        "options": [],
+                        "player": {"potions": []},
+                    }
+                    ready_menu = {
+                        "state_type": "menu",
+                        "menu_screen": "main",
+                        "options": ["continue"],
+                        "player": {"potions": []},
+                    }
+                    self._states = [unknown, unknown, empty_menu, empty_menu, ready_menu, ready_menu]
+                return {}
+
+        fake = FakeReturnMenuClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"action": "return_to_menu"}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=False,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=8,
+            poll_delay=0,
+        )
+
+        self.assertEqual(fake.posts, [{"action": "return_to_menu"}])
+        self.assertEqual(executed[0]["body"], {"action": "return_to_menu"})
+        self.assertEqual(state["state_type"], "menu")
+        self.assertEqual(state["menu_screen"], "main")
+        self.assertEqual(state["options"], ["continue"])
+
+    def test_action_body_accepts_return_to_menu(self):
+        body, state = action_body_from_plan(
+            FakeClient({"state_type": "monster", "player": {"potions": []}}),
+            {"action": "return_to_menu"},
+            auto_target=False,
+        )
+
+        self.assertEqual(body, {"action": "return_to_menu"})
+        self.assertIsNone(state)
+
     def test_cards_parser_accepts_wait_budget_flags(self):
         args = build_parser().parse_args(["cards", "Strike", "--max-polls", "80"])
 
@@ -2320,6 +2506,10 @@ class FastCliTests(unittest.TestCase):
         self.assertEqual(args.poll_delay, DEFAULT_POLL_DELAY)
         self.assertEqual(args.max_polls, DEFAULT_MENU_MAX_POLLS)
 
+        args = build_parser().parse_args(["return-menu"])
+        self.assertEqual(args.poll_delay, DEFAULT_POLL_DELAY)
+        self.assertEqual(args.max_polls, DEFAULT_MENU_MAX_POLLS)
+
         args = build_parser().parse_args(["start-run"])
         self.assertEqual(args.poll_delay, DEFAULT_POLL_DELAY)
         self.assertEqual(args.max_polls, DEFAULT_START_RUN_MAX_POLLS)
@@ -2329,12 +2519,24 @@ class FastCliTests(unittest.TestCase):
         self.assertEqual(args.command, "menu")
         self.assertTrue(args.no_wait)
 
+        args = build_parser().parse_args(["return-menu", "--no-wait"])
+        self.assertEqual(args.command, "return-menu")
+        self.assertTrue(args.no_wait)
+
         args = build_parser().parse_args(["map"])
         self.assertEqual(args.command, "map")
 
         args = build_parser().parse_args(["start-run", "--character", "first"])
         self.assertEqual(args.command, "start-run")
         self.assertEqual(args.character, "first")
+
+        args = build_parser().parse_args(["start-run", "--auto-reveal-timeline"])
+        self.assertTrue(args.auto_reveal_timeline)
+
+        args = build_parser().parse_args(["timeline", "reveal", "--dry-run"])
+        self.assertEqual(args.command, "timeline")
+        self.assertEqual(args.action, "reveal")
+        self.assertTrue(args.dry_run)
 
         args = build_parser().parse_args(["wiki", "perfected strike", "--item-type", "card"])
         self.assertEqual(args.command, "wiki")
@@ -2343,6 +2545,64 @@ class FastCliTests(unittest.TestCase):
         args = build_parser().parse_args(["--multiplayer", "state", "--raw-format", "markdown"])
         self.assertTrue(args.multiplayer)
         self.assertEqual(args.raw_format, "markdown")
+
+    def test_timeline_status_command_dispatches_get(self):
+        fake = FakeTimelineCliClient()
+        captured = StringIO()
+
+        with patch.object(cli_module, "make_client", return_value=fake), redirect_stdout(captured):
+            code = run(["--compact", "--no-log", "timeline", "status"])
+
+        output = json.loads(captured.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(output["ok"])
+        self.assertEqual(fake.gets, [{"path": "/api/v1/timeline", "params": None}])
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(output["data"]["pending_epoch_ids"], ["epoch_a"])
+
+    def test_timeline_reveal_command_dispatches_post_dry_run(self):
+        fake = FakeTimelineCliClient()
+        captured = StringIO()
+
+        with patch.object(cli_module, "make_client", return_value=fake), redirect_stdout(captured):
+            code = run(["--compact", "--no-log", "timeline", "reveal", "--dry-run"])
+
+        output = json.loads(captured.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(output["ok"])
+        self.assertEqual(fake.gets, [])
+        self.assertEqual(
+            fake.posts,
+            [
+                {
+                    "path": "/api/v1/timeline",
+                    "body": {"action": "reveal_pending", "dry_run": True},
+                }
+            ],
+        )
+        self.assertTrue(output["data"]["dry_run"])
+
+    def test_timeline_reveal_command_returns_nonzero_for_slot_unlock_epoch(self):
+        fake = FakeTimelineErrorCliClient()
+        captured = StringIO()
+
+        with patch.object(cli_module, "make_client", return_value=fake), redirect_stdout(captured):
+            code = run(["--compact", "--no-log", "timeline", "reveal"])
+
+        output = json.loads(captured.getvalue())
+        self.assertEqual(code, 1)
+        self.assertFalse(output["ok"])
+        self.assertEqual(output["data"]["pending_slot_unlock_epoch_ids"], ["NEOW_EPOCH"])
+        self.assertIn("ObtainedNoSlot", output["data"]["error"])
+        self.assertEqual(
+            fake.posts,
+            [
+                {
+                    "path": "/api/v1/timeline",
+                    "body": {"action": "reveal_pending", "dry_run": False},
+                }
+            ],
+        )
 
     def test_act_map_data_returns_whole_map_graph(self):
         data = act_map_data(
@@ -2813,6 +3073,90 @@ class FastCliTests(unittest.TestCase):
             )
 
         self.assertEqual(fake.posts, [{"action": "menu_select", "option": "main_menu"}])
+
+    def test_start_run_refuses_slot_unlock_timeline_blocker_before_auto_reveal(self):
+        fake = FakeSlotUnlockTimelineStartRunClient()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "slot-unlock epochs.*pending_slot_unlock_epoch_ids=.*NEOW_EPOCH",
+        ):
+            start_run(
+                fake,
+                logger=quiet_logger(),
+                stats=RunStats(),
+                mode="standard",
+                character="ironclad",
+                seed=None,
+                max_steps=8,
+                max_polls=3,
+                poll_delay=0,
+                auto_reveal_timeline=True,
+            )
+
+        self.assertEqual(fake.timeline_gets, [{"path": "/api/v1/timeline", "params": None}])
+        self.assertEqual(fake.timeline_posts, [])
+        self.assertEqual(fake.posts, [])
+
+    def test_start_run_can_auto_reveal_timeline_blocker(self):
+        fake = FakeAutoRevealTimelineStartRunClient()
+        stats = RunStats()
+
+        state, executed = start_run(
+            fake,
+            logger=quiet_logger(),
+            stats=stats,
+            mode="standard",
+            character="ironclad",
+            seed=None,
+            max_steps=10,
+            max_polls=3,
+            poll_delay=0,
+            auto_reveal_timeline=True,
+        )
+
+        self.assertEqual(state["state_type"], "map")
+        self.assertEqual(
+            fake.timeline_posts,
+            [
+                {
+                    "path": "/api/v1/timeline",
+                    "body": {"action": "reveal_pending", "dry_run": False},
+                }
+            ],
+        )
+        self.assertEqual(executed[0]["planned"], {"action": "timeline_reveal_pending"})
+        self.assertEqual(
+            [step["body"]["option"] for step in executed[1:]],
+            ["singleplayer", "standard", "ironclad", "confirm"],
+        )
+
+    def test_start_run_auto_reveal_fails_if_blocker_remains(self):
+        fake = FakeStuckTimelineStartRunClient()
+
+        with self.assertRaisesRegex(RuntimeError, "auto reveal did not clear"):
+            start_run(
+                fake,
+                logger=quiet_logger(),
+                stats=RunStats(),
+                mode="standard",
+                character="ironclad",
+                seed=None,
+                max_steps=10,
+                max_polls=3,
+                poll_delay=0,
+                auto_reveal_timeline=True,
+            )
+
+        self.assertEqual(
+            fake.timeline_posts,
+            [
+                {
+                    "path": "/api/v1/timeline",
+                    "body": {"action": "reveal_pending", "dry_run": False},
+                }
+            ],
+        )
 
     def test_start_run_refuses_active_run_state(self):
         with self.assertRaisesRegex(RuntimeError, "Cannot start a run"):

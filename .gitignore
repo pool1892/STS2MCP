@@ -2,6 +2,10 @@ bin/
 obj/
 out/
 logs/
+artifacts/
+.dotnet/
+.uv-cache/
+.nuget/
 
 # Python
 __pycache__/

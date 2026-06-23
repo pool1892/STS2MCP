@@ -8,6 +8,8 @@ HTTP API served by the STS2_MCP mod on `localhost:15526`. No authentication. Loc
 - `GET  /api/v1/multiplayer` — read multiplayer game state
 - `POST /api/v1/multiplayer` — perform a multiplayer action
 - `GET  /api/v1/profile` — read current profile progress
+- `GET  /api/v1/timeline` — read active profile Timeline reveal status
+- `POST /api/v1/timeline` — reveal pending obtained Timeline epochs
 - `GET  /api/v1/compendium` — read Compendium-shaped profile progress
 - `GET  /api/v1/wiki` — fuzzy-search discovered card/relic wiki entries
 - `GET  /api/v1/profiles` — list profile slots
@@ -886,6 +888,49 @@ Profile endpoints are independent of the singleplayer and multiplayer run endpoi
 
 Returns the active profile's persistent progress summary, including character stats, card stats, encounter stats, discovered content, achievements, epochs, and global totals.
 
+### `GET /api/v1/timeline`
+
+Returns active profile Timeline epochs and the pending obtained-but-unrevealed
+epoch ids. This endpoint is read-only and uses the same active profile progress
+source as `GET /api/v1/profile`.
+
+```jsonc
+{
+  "status": "ok",
+  "current_profile_id": 1,
+  "progress_path": "/.../profile1/saves/progress.save",
+  "pending_epoch_ids": ["IRONCLAD4_EPOCH"],
+  "pending_count": 1,
+  "epochs": [
+    { "id": "IRONCLAD4_EPOCH", "state": "Obtained", "obtained": 1782170738 }
+  ]
+}
+```
+
+### `POST /api/v1/timeline`
+
+Reveal pending obtained Timeline epochs without opening the fragile Timeline UI.
+Mutating reveal is allowed only from the active main menu state that exposes the
+Timeline blocker; use `dry_run` or `GET /api/v1/timeline` for inspection from
+other states:
+
+```json
+{ "action": "reveal_pending" }
+```
+
+Optional dry run:
+
+```json
+{ "action": "reveal_pending", "dry_run": true }
+```
+
+Only epochs whose state is `Obtained` and are referenced by the current
+main-menu blocker are changed to `Revealed`. Epochs in `ObtainedNoSlot` are
+reported as `pending_slot_unlock_epoch_ids` and refused because they require
+slot/unlock side effects before reveal; marking them revealed directly can leave
+Single Player hidden. `dry_run` returns the pending ids without mutating
+progress.
+
 ### `GET /api/v1/compendium`
 
 Returns the active profile's progress grouped by the in-game Compendium cards:
@@ -1082,6 +1127,18 @@ Select an option from the main menu, a menu submenu, profile select, character s
 
 `game_over` advertises only `main_menu`. `continue` is not actionable on that screen and returns an error.
 If `timeline` is blocked by pending obtained epochs, `menu_select` returns an error with `manual_action_required: true` and `pending_epoch_ids` instead of opening Timeline.
+
+---
+
+### `return_to_menu`
+
+Return an active run to the main menu without creating a new run save.
+
+```json
+{ "action": "return_to_menu" }
+```
+
+This is intended for checkpoint replay and local search. Restore or otherwise prepare `current_run.save` before calling `return_to_menu`, then use `menu_select` with `continue` after the main menu is visible. The action refuses to run while a run-save task is still in progress, because a pending save could overwrite the restored checkpoint file.
 
 ---
 

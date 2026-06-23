@@ -32,7 +32,10 @@ using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Entities.Potions;
 using MegaCrit.Sts2.Core.GameActions;
+using MegaCrit.Sts2.Core.Helpers;
+using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Runs;
+using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 using MegaCrit.Sts2.Core.Nodes.Screens.MainMenu;
 using MegaCrit.Sts2.Core.Nodes.Screens.GameOverScreen;
@@ -64,6 +67,7 @@ public static partial class McpMod
             "use_potion" => ExecuteUsePotion(player, data),
             "discard_potion" => ExecuteDiscardPotion(player, data),
             "end_turn" => ExecuteEndTurn(player),
+            "return_to_menu" => ExecuteReturnToMenu(),
             "choose_map_node" => ExecuteChooseMapNode(data),
             "choose_event_option" => ExecuteChooseEventOption(data),
             "advance_dialogue" => ExecuteAdvanceDialogue(),
@@ -90,6 +94,27 @@ public static partial class McpMod
             "crystal_sphere_click_cell" => ExecuteCrystalSphereClickCell(data),
             "crystal_sphere_proceed" => ExecuteCrystalSphereProceed(),
             _ => Error($"Unknown action: {action}")
+        };
+    }
+
+    private static Dictionary<string, object?> ExecuteReturnToMenu()
+    {
+        var pendingSave = SaveManager.Instance.CurrentRunSaveTask;
+        if (pendingSave is { IsCompleted: false })
+            return Error("A run save is still in progress; wait for it to finish before returning to menu for checkpoint replay.");
+
+        var game = NGame.Instance;
+        if (game == null)
+            return Error("Game instance is not available");
+
+        TaskHelper.RunSafely(game.ReturnToMainMenu());
+
+        return new Dictionary<string, object?>
+        {
+            ["status"] = "ok",
+            ["message"] = "Returning to main menu without creating a new run save",
+            ["preserves_current_run_save"] = true,
+            ["next"] = "Use menu_select continue after the menu state is visible to reload current_run.save"
         };
     }
 

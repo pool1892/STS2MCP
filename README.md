@@ -108,8 +108,11 @@ server:
 - `map`: full current act map graph for route planning while on a map screen.
 - `start-run`: walk main menu -> singleplayer mode -> character select ->
   embark for a fresh singleplayer run. If post-game Timeline epochs require
-  manual reveal before singleplayer returns, the CLI reports the pending ids
-  instead of trying to bypass the manual game ceremony.
+  reveal before singleplayer returns, the CLI reports the pending ids. Run
+  `timeline reveal` first, or pass `--auto-reveal-timeline` to mark pending
+  `Obtained` epochs as revealed before startup continues. Epochs in
+  `ObtainedNoSlot` state require slot/unlock side effects first and are refused
+  instead of being partially marked revealed.
 - `menu`: select visible menu, lobby, Timeline, tutorial/popup, profile, or
   game-over options through the old `menu_select` action.
 - `act`: execute a JSON action plan. It accepts ergonomic shorthands like
@@ -123,6 +126,8 @@ server:
 - `drain`: resolve no-decision screens without model deliberation.
 - `profile`, `compendium`, `wiki`, `profiles`, `switch-profile`,
   `delete-profile`: profile progress, durable lookup, and profile slot tools.
+- `timeline`: inspect or reveal safe pending obtained Timeline epochs so
+  post-game unlock screens do not interrupt looped CLI runs.
 - `analyze-log`: summarize JSONL timing logs, including HTTP, wait, stdout,
   local overhead, and next-POST gaps.
 
@@ -152,6 +157,8 @@ points to the CLI reference and gameplay policy.
 The HTTP API exposes profile-level progress separately from live run state:
 
 - `GET /api/v1/profile` returns the active profile's persistent progress summary, including discoveries, achievements, epochs, character totals, and global run totals.
+- `GET /api/v1/timeline` returns active profile Timeline epochs and the pending obtained-but-unrevealed ids.
+- `POST /api/v1/timeline` with `{ "action": "reveal_pending" }` marks only pending `Obtained` Timeline epochs as revealed and saves active profile progress, but only while the active main menu is blocked by pending Timeline reveal. It reports `pending_slot_unlock_epoch_ids` and refuses `ObtainedNoSlot` epochs because those need slot/unlock side effects before reveal. Add `"dry_run": true` to inspect without changing progress.
 - `GET /api/v1/compendium` groups that progress into the same high-level sections as the in-game Compendium: Card Library, Relic Collection, Potion Lab, Bestiary, Character Stats, and Run History.
 - `GET /api/v1/wiki?query=...` searches discovered card and relic wiki entries for the active profile with fuzzy matching. Results are limited to 10 by default and can be overridden with `limit`; card results include base and upgraded variants when available.
 - `GET /api/v1/profiles` lists the three profile slots and the active profile.

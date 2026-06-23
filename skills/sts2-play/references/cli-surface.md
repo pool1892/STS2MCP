@@ -71,8 +71,10 @@ Global flags must come before the subcommand.
 | `cards CARD...` | Play card names in order with index re-resolution between plays. | `--target POLICY`, `--end-turn`, `--drain`, `--fast-action-waits`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
 | `analyze-log PATH...` | Summarize one or more JSONL timing logs. | Paths may be files or glob patterns. Empty globs fail loudly. |
 | `menu OPTION` | Select a visible menu/lobby/game-over/popup/profile option. | `--seed SEED`, `--no-wait`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
-| `start-run` | Start a fresh singleplayer run from menu or game over. | `--mode standard|daily|custom`, `--character CHARACTER|first`, `--seed SEED`, `--max-steps N`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
+| `return-menu` | Return an active run to the main menu without creating a new run save. | `--no-wait`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
+| `start-run` | Start a fresh singleplayer run from menu or game over. | `--mode standard|daily|custom`, `--character CHARACTER|first`, `--seed SEED`, `--auto-reveal-timeline`, `--max-steps N`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
 | `profile` | Read active profile progress. | none |
+| `timeline` | Inspect or reveal pending obtained Timeline epochs. | `status|reveal`, `--dry-run` for `reveal` |
 | `compendium` | Read profile compendium/run-history context. | none |
 | `wiki QUERY` | Search profile-unlocked card/relic wiki entries. | `--item-type all|card|relic`, `--limit N` |
 | `profiles` | List profile slots. | `--delete PROFILE_ID` is a legacy-compatible shortcut for deleting an inactive slot. |
@@ -104,7 +106,7 @@ Successful data output:
 - `ok`: `true`.
 - `summary`: timing and log metadata.
 - `data`: structured JSON for `profile`, `compendium`, `wiki`, `profiles`,
-  `switch-profile`, `delete-profile`, and raw JSON state.
+  `timeline`, `switch-profile`, `delete-profile`, and raw JSON state.
 - `text`: raw Markdown state when using `state --raw-format markdown`.
 
 Failure output:
@@ -171,6 +173,7 @@ Start a normal run from the menu:
 uv run --directory cli python sts2_fast_cli.py --compact start-run --character ironclad
 uv run --directory cli python sts2_fast_cli.py --compact start-run --character first
 uv run --directory cli python sts2_fast_cli.py --compact start-run --mode daily --character first
+uv run --directory cli python sts2_fast_cli.py --compact start-run --auto-reveal-timeline --character ironclad
 ```
 
 Menu/lobby/game-over/profile/timeline/popup control:
@@ -184,6 +187,7 @@ uv run --directory cli python sts2_fast_cli.py --compact menu main_menu
 uv run --directory cli python sts2_fast_cli.py --compact menu advance
 uv run --directory cli python sts2_fast_cli.py --compact menu join_0
 uv run --directory cli python sts2_fast_cli.py --compact menu confirm --no-wait
+uv run --directory cli python sts2_fast_cli.py --compact return-menu
 ```
 
 - `menu` wraps the API `menu_select` action.
@@ -194,14 +198,21 @@ uv run --directory cli python sts2_fast_cli.py --compact menu confirm --no-wait
   typically the final confirm/embark step.
 - Use `--no-wait` only when the selected option is expected to keep the visible
   state unchanged. Normal gameplay should let the CLI wait for the next state.
+- `return-menu` wraps the API `return_to_menu` action. It cleans up the active
+  in-memory run and shows the main menu without creating a new run save. For
+  checkpoint replay, restore `current_run.save` before running `return-menu`,
+  then use `menu continue` after the main menu is visible.
 - `start-run` refuses to start from an active run; it is startup ceremony, not
   an abandon-run tool.
 - `start-run` can begin from main menu or game-over. It walks through
   singleplayer, mode select, character select, and confirm/embark.
 - If the post-game main menu hides singleplayer because Timeline epochs require
-  manual reveal, `start-run` exits with an actionable error that includes the
-  pending epoch ids. The mod intentionally blocks automation from opening that
-  Timeline state; clear the reveal in game, then run `start-run` again.
+  reveal, `start-run` exits with an actionable error that includes the pending
+  epoch ids. Run `timeline reveal` first, or pass `--auto-reveal-timeline` to
+  let `start-run` mark safe pending `Obtained` epochs as revealed before
+  continuing. `ObtainedNoSlot` epochs are refused because they require
+  slot/unlock side effects before reveal. This avoids opening the fragile
+  Timeline UI state that previously logged invalid unlock-state errors.
 
 ## Gameplay Actions
 
@@ -452,6 +463,9 @@ poll budgets.
 
 ```fish
 uv run --directory cli python sts2_fast_cli.py --compact profile
+uv run --directory cli python sts2_fast_cli.py --compact timeline status
+uv run --directory cli python sts2_fast_cli.py --compact timeline reveal --dry-run
+uv run --directory cli python sts2_fast_cli.py --compact timeline reveal
 uv run --directory cli python sts2_fast_cli.py --compact compendium
 uv run --directory cli python sts2_fast_cli.py --compact wiki "perfected strike" --item-type card --limit 5
 uv run --directory cli python sts2_fast_cli.py --compact profiles
@@ -460,6 +474,13 @@ uv run --directory cli python sts2_fast_cli.py --compact delete-profile 3
 ```
 
 - `profile` maps to old MCP `get_profile`.
+- `timeline status` reads pending obtained Timeline epochs from the active
+  profile, including `pending_slot_unlock_epoch_ids` for `ObtainedNoSlot`.
+  `timeline reveal` marks only `Obtained` epochs as `Revealed` when the active
+  main menu is blocked by pending Timeline reveal, then saves active profile
+  progress. It refuses `ObtainedNoSlot` because marking those revealed without
+  slot/unlock side effects can leave Single Player hidden. Use `--dry-run` to
+  inspect the pending ids without mutation.
 - `compendium` maps to old MCP `get_compendium`.
 - `wiki` maps to old MCP `search_wiki`.
 - `profiles`, `switch-profile`, and `delete-profile` map to old MCP profile

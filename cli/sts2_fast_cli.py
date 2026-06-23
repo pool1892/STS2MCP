@@ -252,6 +252,10 @@ class STS2Client:
         validate_post_response(result, body)
         return result
 
+    def post_json_unchecked(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        data = self._request("POST", path, json_body=body)
+        return data if isinstance(data, dict) else {}
+
     def _request_text(
         self,
         method: str,
@@ -306,6 +310,12 @@ def validate_post_response(result: dict[str, Any], body: dict[str, Any]) -> None
         action = body.get("action")
         detail = error or result.get("detail") or result.get("message") or "unknown error"
         raise RuntimeError(f"Action {action!r} failed: {detail}")
+
+
+def post_json_unchecked(client: Any, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    if hasattr(client, "post_json_unchecked"):
+        return client.post_json_unchecked(path, body)
+    return client.post_json(path, body)
 
 
 def is_combat_state(state: dict[str, Any]) -> bool:
@@ -780,6 +790,43 @@ def manual_timeline_reveal_pending_epoch_ids(state: dict[str, Any]) -> list[str]
             pending_ids = [pending_ids]
         return [str(epoch_id) for epoch_id in pending_ids if epoch_id is not None]
     return None
+
+
+def timeline_status_data(client: Any) -> dict[str, Any] | None:
+    if not hasattr(client, "get_json"):
+        return None
+    try:
+        data = client.get_json("/api/v1/timeline")
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def pending_slot_unlock_epoch_ids_from_status(status: dict[str, Any] | None) -> list[str]:
+    if not isinstance(status, dict):
+        return []
+    ids = status.get("pending_slot_unlock_epoch_ids") or []
+    if not isinstance(ids, list):
+        ids = [ids]
+    return [str(epoch_id) for epoch_id in ids if epoch_id is not None]
+
+
+def reveal_pending_timeline_epochs(client: Any) -> dict[str, Any]:
+    if not hasattr(client, "post_json"):
+        raise RuntimeError("Timeline reveal requires the HTTP client timeline endpoint")
+    result = post_json_unchecked(
+        client,
+        "/api/v1/timeline",
+        {"action": "reveal_pending", "dry_run": False},
+    )
+    if result.get("status") == "error" or result.get("error"):
+        detail = result.get("error") or "Timeline reveal failed"
+        if result.get("pending_slot_unlock_epoch_ids"):
+            detail = f"{detail}; pending_slot_unlock_epoch_ids={result['pending_slot_unlock_epoch_ids']}"
+        elif result.get("pending_epoch_ids"):
+            detail = f"{detail}; pending_epoch_ids={result['pending_epoch_ids']}"
+        raise RuntimeError(detail)
+    return result
 
 
 def state_digest(state: dict[str, Any]) -> dict[str, Any]:
@@ -1716,6 +1763,7 @@ def action_body_from_plan(
 
     raw_map = {
         "end_turn": ("end_turn", None),
+        "return_to_menu": ("return_to_menu", None),
         "undo_end_turn": ("undo_end_turn", None),
         "choose_map_node": ("choose_map_node", "index"),
         "map": ("choose_map_node", "index"),
@@ -2058,6 +2106,52 @@ def wait_for_state_change(
         sleep_for_poll(poll, poll_delay)
     finish(f"{reason}_state_unchanged", max_polls)
     raise RuntimeError(f"Timed out waiting for {reason} state change after {max_polls} polls")
+
+
+def wait_for_main_menu(
+    client: Any,
+    *,
+    logger: JsonlLogger,
+    max_polls: int,
+    poll_delay: float,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason_name: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason_name, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
+    last_state: dict[str, Any] = {}
+    settling_state: dict[str, Any] | None = None
+    stable_polls = 0
+    for poll in range(max_polls):
+        state = client.state()
+        last_state = state
+        if (
+            state.get("state_type") == "menu"
+            and state.get("menu_screen") == "main"
+            and menu_option_names(state, enabled_only=False)
+        ):
+            if settling_state is not None and state_digest_key(state) == state_digest_key(settling_state):
+                stable_polls += 1
+            else:
+                settling_state = state
+                stable_polls = 1
+            if stable_polls >= READY_STATE_SETTLE_POLLS:
+                finish("return_to_menu_main_menu_settled", poll + 1)
+                return state
+        else:
+            settling_state = None
+            stable_polls = 0
+        sleep_for_poll(poll, poll_delay)
+
+    finish("return_to_menu_main_menu_timeout", max_polls)
+    raise RuntimeError(
+        "Timed out waiting for return_to_menu to reach the main menu after "
+        f"{max_polls} polls; last state_type={last_state.get('state_type')!r}, "
+        f"menu_screen={last_state.get('menu_screen')!r}"
+    )
 
 
 def modal_can_confirm(state: dict[str, Any], expected_state_type: str) -> bool:
@@ -2405,6 +2499,7 @@ def should_wait_for_state_change_after(body: dict[str, Any]) -> bool:
         "crystal_sphere_proceed",
         "menu_select",
         "undo_end_turn",
+        "return_to_menu",
     }
 
 
@@ -2540,6 +2635,13 @@ def execute_actions(
             final_state = wait_for_map_node_transition(
                 client,
                 state_before,
+                logger=logger,
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+        elif body.get("action") == "return_to_menu":
+            final_state = wait_for_main_menu(
+                client,
                 logger=logger,
                 max_polls=max_polls,
                 poll_delay=poll_delay,
@@ -2696,9 +2798,11 @@ def start_run(
     max_steps: int,
     max_polls: int,
     poll_delay: float,
+    auto_reveal_timeline: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     executed: list[dict[str, Any]] = []
     state = client.state()
+    attempted_timeline_auto_reveal = False
     for _ in range(max_steps):
         state_type = state.get("state_type")
         if state_type not in {"menu", "game_over"}:
@@ -2726,10 +2830,52 @@ def start_run(
             if not menu_option_enabled(state, "singleplayer"):
                 pending_epoch_ids = manual_timeline_reveal_pending_epoch_ids(state)
                 if pending_epoch_ids is not None:
+                    timeline_status = timeline_status_data(client)
+                    slot_unlock_epoch_ids = pending_slot_unlock_epoch_ids_from_status(timeline_status)
+                    if slot_unlock_epoch_ids:
+                        raise RuntimeError(
+                            "Cannot start a run because Timeline has slot-unlock epochs that "
+                            "cannot be auto-revealed safely; "
+                            f"pending_slot_unlock_epoch_ids={slot_unlock_epoch_ids}. "
+                            "Use `timeline status` and resolve the Timeline unlock side effects "
+                            "before starting a run."
+                        )
+                    if auto_reveal_timeline:
+                        if attempted_timeline_auto_reveal:
+                            raise RuntimeError(
+                                "Timeline auto reveal did not clear the main-menu blocker; "
+                                f"pending_epoch_ids={pending_epoch_ids}. "
+                                "Run `timeline status` and reveal manually in game if needed."
+                            )
+                        attempted_timeline_auto_reveal = True
+                        body = {"action": "reveal_pending", "dry_run": False}
+                        result = reveal_pending_timeline_epochs(client)
+                        step = {
+                            "planned": {"action": "timeline_reveal_pending"},
+                            "body": body,
+                            "result": result,
+                        }
+                        logger.write(
+                            "data_result",
+                            path="/api/v1/timeline",
+                            action="reveal_pending",
+                            data=result,
+                        )
+                        executed.append(step)
+                        state = client.state()
+                        remaining_epoch_ids = manual_timeline_reveal_pending_epoch_ids(state)
+                        if remaining_epoch_ids is not None:
+                            raise RuntimeError(
+                                "Timeline auto reveal did not clear the main-menu blocker; "
+                                f"pending_epoch_ids={remaining_epoch_ids}. "
+                                "Run `timeline status` and reveal manually in game if needed."
+                            )
+                        continue
                     raise RuntimeError(
                         "Cannot start a run because Timeline has epochs that require "
                         "manual Timeline reveal in game before singleplayer is available; "
-                        f"pending_epoch_ids={pending_epoch_ids}"
+                        f"pending_epoch_ids={pending_epoch_ids}. "
+                        "Run `timeline reveal` or pass `--auto-reveal-timeline`."
                     )
                 raise RuntimeError(
                     "Main menu does not expose an enabled singleplayer option; "
@@ -3513,6 +3659,12 @@ def build_parser() -> argparse.ArgumentParser:
     menu.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
     menu.add_argument("--verbose", action="store_true")
 
+    return_menu = sub.add_parser("return-menu", help="Return an active run to the main menu without creating a new run save")
+    return_menu.add_argument("--no-wait", action="store_true", help="Return after the POST instead of waiting for the menu state")
+    return_menu.add_argument("--max-polls", type=int, default=DEFAULT_MENU_MAX_POLLS)
+    return_menu.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
+    return_menu.add_argument("--verbose", action="store_true")
+
     start_run_parser = sub.add_parser("start-run", help="Start a standard singleplayer run from the menu")
     start_run_parser.add_argument("--mode", default="standard", choices=["standard", "daily", "custom"])
     start_run_parser.add_argument("--character", default="ironclad", help="Character id/name, or 'first'")
@@ -3520,9 +3672,17 @@ def build_parser() -> argparse.ArgumentParser:
     start_run_parser.add_argument("--max-steps", type=int, default=8)
     start_run_parser.add_argument("--max-polls", type=int, default=DEFAULT_START_RUN_MAX_POLLS)
     start_run_parser.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
+    start_run_parser.add_argument(
+        "--auto-reveal-timeline",
+        action="store_true",
+        help="Mark pending obtained Timeline epochs as revealed if they block the main menu",
+    )
     start_run_parser.add_argument("--verbose", action="store_true")
 
     sub.add_parser("profile", help="Get active profile progress")
+    timeline = sub.add_parser("timeline", help="Inspect or reveal pending Timeline unlocks")
+    timeline.add_argument("action", nargs="?", default="status", choices=["status", "reveal"])
+    timeline.add_argument("--dry-run", action="store_true", help="Show pending reveals without changing progress")
     sub.add_parser("compendium", help="Get active profile compendium")
     profiles = sub.add_parser("profiles", help="List profile slots")
     profiles.add_argument("--delete", type=int, default=None, help="Delete an inactive profile slot")
@@ -3689,15 +3849,18 @@ def run(argv: list[str] | None = None) -> int:
             )
             return 0
 
-        if args.command == "start-run":
-            state, executed = start_run(
+        if args.command == "return-menu":
+            planned: dict[str, Any] = {"action": "return_to_menu"}
+            if args.no_wait:
+                planned["_wait"] = False
+            state, executed = execute_actions(
                 client,
+                [planned],
                 logger=logger,
                 stats=stats,
-                mode=args.mode,
-                character=args.character,
-                seed=args.seed,
-                max_steps=args.max_steps,
+                auto_target=False,
+                drain_after=False,
+                wait_after_end_turn=True,
                 max_polls=args.max_polls,
                 poll_delay=args.poll_delay,
             )
@@ -3713,6 +3876,54 @@ def run(argv: list[str] | None = None) -> int:
                 indent=indent,
             )
             return 0
+
+        if args.command == "start-run":
+            state, executed = start_run(
+                client,
+                logger=logger,
+                stats=stats,
+                mode=args.mode,
+                character=args.character,
+                seed=args.seed,
+                max_steps=args.max_steps,
+                max_polls=args.max_polls,
+                poll_delay=args.poll_delay,
+                auto_reveal_timeline=args.auto_reveal_timeline,
+            )
+            log_state_result(logger, state)
+            emit_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                state=state,
+                executed=executed,
+                verbose=args.verbose,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "timeline":
+            if args.action == "status":
+                data = client.get_json("/api/v1/timeline")
+                action_name = "status"
+            else:
+                data = post_json_unchecked(
+                    client,
+                    "/api/v1/timeline",
+                    {"action": "reveal_pending", "dry_run": args.dry_run},
+                )
+                action_name = "reveal_pending"
+            logger.write("data_result", path="/api/v1/timeline", action=action_name, data=data)
+            emit_data_result(
+                ok=data.get("status") != "error",
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
+                indent=indent,
+            )
+            return 0 if data.get("status") != "error" else 1
 
         if args.command == "profile":
             data = client.get_json("/api/v1/profile")

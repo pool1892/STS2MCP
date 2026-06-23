@@ -7,6 +7,8 @@ HTTP API on `localhost:15526`. No authentication.
 - `GET /api/v1/multiplayer` — read multiplayer state
 - `POST /api/v1/multiplayer` — perform multiplayer action
 - `GET /api/v1/profile` — read current profile progress
+- `GET /api/v1/timeline` — read active profile Timeline reveal status
+- `POST /api/v1/timeline` — reveal pending obtained Timeline epochs
 - `GET /api/v1/compendium` — read Compendium-shaped profile progress
 - `GET /api/v1/wiki` — fuzzy-search discovered card/relic wiki entries
 - `GET /api/v1/profiles` — list profile slots
@@ -50,6 +52,8 @@ Every JSON response includes:
 
 **Note:** `use_potion` and `discard_potion` work during any state where potions are accessible (combat, map, events, etc.).
 
+**Checkpoint replay:** active run states also accept `return_to_menu`, which returns to the main menu without creating a new run save. Restore `current_run.save` first, then call `menu_select` with `continue` from the main menu.
+
 ## POST — Actions
 
 All POST requests use JSON body with `"action"` field. All responses include `{ "status": "ok" | "error", "message": "..." }`.
@@ -59,10 +63,13 @@ All POST requests use JSON body with `"action"` field. All responses include `{ 
 | Action | Parameters | When to Use |
 |---|---|---|
 | `menu_select` | `option`: string, `seed`?: string | Choose an advertised menu option. Options are case-insensitive. Submenus include `back` where visible, including `profile_select` options `profile_1`, `profile_2`, `profile_3`, and `back`. Blocking popups expose normalized button labels such as `ignore` or `back`. `game_over` supports `main_menu` only; `continue` returns an error. Supplying `seed` in unsupported contexts such as standard singleplayer character select returns an error and does not start a run. If Timeline has pending obtained epochs that require manual reveal, it may appear in `blocked_options`; selecting `timeline` returns `manual_action_required: true` with `pending_epoch_ids` instead of opening Timeline. Multiplayer flow: on `multiplayer_join` use `refresh` / `back` / `join_<index>` / `join_<player_id>`. On `multiplayer_load_lobby` use `confirm` (or `embark`) to ready up, `unready` to retract, `back` to leave. On `character_select` while in MP, an additional `unready` option becomes available after readying, plus a `lobby` block in state lists ascension, all_ready, and per-player roster. |
+| `return_to_menu` | none | From an active run, clean up the in-memory run and show the main menu without creating a new run save. For checkpoint replay, restore `current_run.save` before calling this action, then use `menu_select` with `continue`. |
 
 ### Profiles
 
 `GET /api/v1/profile` returns persistent progress for the active profile, including character stats, discoveries, achievements, epochs, and global run totals.
+
+`GET /api/v1/timeline` returns active profile Timeline epochs plus pending obtained-but-unrevealed epoch ids, including `pending_slot_unlock_epoch_ids` for `ObtainedNoSlot`. `POST /api/v1/timeline` with `{ "action": "reveal_pending" }` marks only main-menu-blocking `Obtained` epochs as `Revealed` and saves progress. It refuses `ObtainedNoSlot` epochs because they require slot/unlock side effects before reveal; add `"dry_run": true` to inspect without mutation.
 
 `GET /api/v1/compendium` returns the active profile grouped like the in-game Compendium:
 
