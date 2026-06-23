@@ -10,6 +10,8 @@ acting:
   event decisions.
 - `skills/sts2-learning-loop/SKILL.md` for run notes, timing friction, and
   self-improvement observations.
+- `skills/sts2-play/references/cli-surface.md` for the full CLI command
+  surface and MCP parity table.
 - `skills/sts2-play/references/http-api.md` for state shape, POST actions, and
   no-decision drain rules.
 - `skills/sts2-play/references/gameplay-policy.md` for tactical and strategic
@@ -22,6 +24,17 @@ This fork intentionally has one agent-control surface: the repo-local CLI at
 policy. Do not start, configure, or call a separate tool server for gameplay.
 Direct localhost HTTP calls are a debugging fallback and the underlying
 contract, not the default agent play surface.
+The CLI must preserve feature parity with the original MCP bridge; when adding
+or changing mod/API capabilities, update the CLI and
+`skills/sts2-play/references/cli-surface.md` together.
+
+When the CLI is wanting, slow, missing a needed capability, or behaving
+differently from what optimal gameplay requires, fix the CLI instead of working
+around it. If runtime policy permits subagents, spawn a focused subagent for the
+CLI improvement and have it update both `cli/sts2_fast_cli.py` and the
+corresponding gameplay skill/reference docs in the same slice. If subagents are
+unavailable, make the same CLI and skill updates directly before continuing
+long-form play.
 
 ## CLI State Tips
 
@@ -33,6 +46,8 @@ contract, not the default agent play surface.
   until the state is ready.
 - Prefer `uv run --directory cli python sts2_fast_cli.py --compact state --drain`
   for normal play state reads.
+- Prefer `uv run --directory cli python sts2_fast_cli.py --compact map` for
+  whole-act route planning while on the map screen.
 - The underlying structured state is `GET /api/v1/singleplayer?format=json`.
 
 ### Card Index Shifting
@@ -71,6 +86,10 @@ contract, not the default agent play surface.
 2. Play skills before attacks when possible — many mechanics reward this order (e.g. Slow debuff on enemies stacks per card played).
 3. Play biggest attacks last to benefit from accumulated buffs/debuffs.
 4. Check enemy HP — if you can kill this turn, skip blocking entirely.
+5. Read enemy status effects before every turn plan. Buffs like Ritual,
+   Strength gain, and other per-turn scaling are tactical clocks; if an enemy is
+   gaining large Strength every turn, shift from setup to damage racing,
+   Weak/Vulnerable, and lethal pressure.
 
 ### Map Pathing
 - **Elites** give relics — fight them when healthy (>70% HP).

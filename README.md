@@ -80,14 +80,64 @@ Common gameplay commands:
 
 ```bash
 uv run --directory cli python sts2_fast_cli.py --compact state --drain
+uv run --directory cli python sts2_fast_cli.py --compact map
+uv run --directory cli python sts2_fast_cli.py --compact start-run --character ironclad
+uv run --directory cli python sts2_fast_cli.py --compact menu main_menu
 uv run --directory cli python sts2_fast_cli.py --compact act '[{"play":"Shrug It Off+"},{"play":"Uppercut+","target":"first"},{"end_turn":true}]' --drain --max-polls 80
 uv run --directory cli python sts2_fast_cli.py analyze-log 'logs/sts2-fast/act2-fight-01*.jsonl'
 ```
 
 The CLI accepts `--base-url`, `--timeout`, `--trust-env`, `--log`, and
-`--compact` flags. It talks to the same localhost HTTP API exposed by the game
-mod, batches deterministic actions, drains no-decision screens, polls
-transitions, and writes timing logs.
+`--compact` flags, plus `--no-log` to disable JSONL logging and
+`--multiplayer` to route run state/actions through the multiplayer endpoint. It
+talks to the same localhost HTTP API exposed by the game mod, batches
+deterministic actions, drains no-decision screens, polls transitions, waits
+through transient states, requires stable combat decision frames after map and
+end-turn transitions, and writes timing logs by default.
+
+#### Fast CLI command surface
+
+The CLI is intended to cover the original MCP bridge without requiring an MCP
+server:
+
+- `state`: concise current run state; use `--drain`, `--verbose`, or
+  `--raw-format json|markdown` for MCP-compatible state output.
+- `map`: full current act map graph for route planning while on a map screen.
+- `start-run`: walk main menu -> singleplayer mode -> character select ->
+  embark for a fresh singleplayer run.
+- `menu`: select visible menu, lobby, Timeline, tutorial/popup, profile, or
+  game-over options through the old `menu_select` action.
+- `act`: execute a JSON action plan. It accepts ergonomic shorthands like
+  `{"play":"Strike"}` and old MCP tool-name aliases like
+  `{"action":"rewards_claim","reward_index":0}`.
+- `cards`: play card names in order, with optional `--target`, `--end-turn`,
+  and `--drain`.
+- `drain`: resolve no-decision screens without model deliberation.
+- `profile`, `compendium`, `wiki`, `profiles`, `switch-profile`,
+  `delete-profile`: profile progress, durable lookup, and profile slot tools.
+- `analyze-log`: summarize JSONL timing logs, including HTTP, wait, stdout,
+  local overhead, and next-POST gaps.
+
+Multiplayer can be driven with global `--multiplayer`:
+
+```bash
+uv run --directory cli python sts2_fast_cli.py --multiplayer --compact state
+uv run --directory cli python sts2_fast_cli.py --multiplayer --compact act '[{"map":0}]'
+```
+
+Or with old MCP `mp_*` action aliases:
+
+```bash
+uv run --directory cli python sts2_fast_cli.py --compact act '[{"action":"mp_map_vote","node_index":0}]'
+uv run --directory cli python sts2_fast_cli.py --compact act '[{"action":"mp_combat_end_turn"}]'
+```
+
+The full command catalog and MCP parity table live in
+`skills/sts2-play/references/cli-surface.md`. That reference is the canonical
+CLI contract for commands, flags, action shorthands, old MCP aliases,
+no-decision drain rules, waiting behavior, timing logs, multiplayer routing,
+and extension rules. Agents should load `skills/sts2-play/SKILL.md` first; it
+points to the CLI reference and gameplay policy.
 
 ### Profile and Compendium Data
 

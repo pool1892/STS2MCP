@@ -3,6 +3,9 @@
 Use this reference when debugging or extending the fast CLI's localhost API
 contract. Normal gameplay should go through `cli/sts2_fast_cli.py`.
 
+For user-facing CLI commands, startup/menu/profile/wiki commands, multiplayer
+routing, and original MCP tool-name aliases, read `cli-surface.md`.
+
 ## State
 
 Read:
@@ -49,6 +52,8 @@ Common bodies:
 {"action":"proceed"}
 {"action":"choose_event_option","index":0}
 {"action":"advance_dialogue"}
+{"action":"combat_select_card","card_index":1}
+{"action":"combat_confirm_selection"}
 {"action":"select_card","index":15}
 {"action":"confirm_selection"}
 {"action":"cancel_selection"}
@@ -81,8 +86,17 @@ Transient states to keep polling through:
 - Playing a card removes it from hand and shifts remaining indexes.
 - Claiming rewards can shift reward indexes.
 - Card reward selection uses `card_index`.
+- `hand_select` uses `card_index` with `combat_select_card` and
+  `combat_confirm_selection` in the currently loaded Steam mod. This fork's
+  patched bridge also accepts clearer `select_hand_card` and
+  `confirm_hand_selection` aliases after rebuild/reload, but the fast CLI emits
+  the compatibility action names by default.
 - Card/deck selection screens use `index` with `select_card`.
 - Potion actions use potion slot, not card or reward index.
+- Modal selection screens can still expose stale combat hand data under
+  `player.hand`. Treat `state_type` as authoritative: do not send combat
+  actions while `state_type` is `hand_select`, `card_select`, `bundle_select`,
+  or `relic_select`.
 
 For safe batches, repeatedly:
 
@@ -117,6 +131,7 @@ The model should not deliberate over:
 - empty completed rest/reward/treasure screens
 - dialogue advance with no options
 - maps with exactly one next node
+- shops where no stocked item is affordable
 
 These should be resolved by direct HTTP POSTs and followed by polling.
 

@@ -79,8 +79,10 @@ public static partial class McpMod
             "select_bundle" => ExecuteSelectBundle(data),
             "confirm_bundle_selection" => ExecuteConfirmBundleSelection(),
             "cancel_bundle_selection" => ExecuteCancelBundleSelection(),
-            "combat_select_card" => ExecuteCombatSelectCard(data),
-            "combat_confirm_selection" => ExecuteCombatConfirmSelection(),
+            "select_hand_card" => ExecuteSelectHandCard(data),
+            "confirm_hand_selection" => ExecuteConfirmHandSelection(),
+            "combat_select_card" => ExecuteSelectHandCard(data),
+            "combat_confirm_selection" => ExecuteConfirmHandSelection(),
             "select_relic" => ExecuteSelectRelic(data),
             "skip_relic_selection" => ExecuteSkipRelicSelection(),
             "claim_treasure_relic" => ExecuteClaimTreasureRelic(data),
@@ -838,11 +840,11 @@ public static partial class McpMod
         };
     }
 
-    private static Dictionary<string, object?> ExecuteCombatSelectCard(Dictionary<string, JsonElement> data)
+    private static Dictionary<string, object?> ExecuteSelectHandCard(Dictionary<string, JsonElement> data)
     {
         var hand = NPlayerHand.Instance;
-        if (hand == null || !hand.IsInCardSelection)
-            return Error("No in-combat card selection is active");
+        if (hand == null || hand.CurrentMode == NPlayerHand.Mode.Play)
+            return Error("No hand selection is active");
 
         if (!data.TryGetValue("card_index", out var indexElem))
             return Error("Missing 'card_index' (index of the card in hand)");
@@ -865,11 +867,11 @@ public static partial class McpMod
         };
     }
 
-    private static Dictionary<string, object?> ExecuteCombatConfirmSelection()
+    private static Dictionary<string, object?> ExecuteConfirmHandSelection()
     {
         var hand = NPlayerHand.Instance;
-        if (hand == null || !hand.IsInCardSelection)
-            return Error("No in-combat card selection is active");
+        if (hand == null || hand.CurrentMode == NPlayerHand.Mode.Play)
+            return Error("No hand selection is active");
 
         var confirmBtn = hand.GetNodeOrNull<NConfirmButton>("%SelectModeConfirmButton");
         if (confirmBtn == null || !confirmBtn.IsEnabled)

@@ -27,6 +27,13 @@ Use this reference when making strategic and tactical choices during a run.
   damage.
 - Against leader/minion fights, target the leader when minions flee or become
   irrelevant after leader death.
+- Treat enemy status effects as first-class tactical inputs every turn. Scaling
+  buffs such as `Ritual`, Strength gain, escalating intent powers, or any
+  "gains N each turn" effect create a clock; race them with front-loaded
+  damage, Weak, Vulnerable, and lethal pressure instead of slow setup.
+- When an enemy scales by a fixed amount per turn, calculate the next two
+  attack turns before choosing block versus damage. A 9 Strength/turn enemy is
+  usually a damage race, not a normal block-and-scale fight.
 
 ## Ironclad Heuristics From This Run
 
@@ -88,3 +95,7 @@ cards that do not swing a fight.
 - Act 2 at low HP should favor rest and survival over optional elite greed.
 - Bowlbug-style multi-enemy fights punish slow setup; stabilize or kill one
   target quickly to reduce incoming damage.
+- Devoted Sculptor with `Ritual 9` is a pure damage race. Do not treat the
+  status list as passive context: each turn adds 9 Strength and makes the next
+  attack much harder to block. Prioritize Weak/Vulnerable and burst damage over
+  slow powers unless the hand also covers the immediate attack.

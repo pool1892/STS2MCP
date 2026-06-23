@@ -3,21 +3,40 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 
 from sts2_fast_cli import (
+    DELAYED_CARD_SETTLE_POLLS,
+    DEFAULT_INITIAL_POLL_DELAY,
+    DEFAULT_MAX_POLLS,
+    DEFAULT_MENU_MAX_POLLS,
+    DEFAULT_POLL_DELAY,
+    DEFAULT_START_RUN_MAX_POLLS,
     JsonlLogger,
+    MAP_COMBAT_SETTLE_POLLS,
+    SELECTION_CARD_SETTLE_POLLS,
+    START_TURN_SETTLE_POLLS,
     RunStats,
     action_body_from_plan,
+    act_map_data,
     analyze_log,
     analyze_logs,
     build_parser,
+    choose_character_option,
     decision_point,
     drain_trivial,
+    emit_result,
+    execute_menu_option,
     execute_actions,
     expand_log_path_args,
     normalize_action,
+    output_log_path,
+    start_run,
     next_trivial_action,
+    summarize_state,
     state_delta,
     validate_post_response,
 )
@@ -167,6 +186,90 @@ class FakeEffectDelayedPlayClient:
         return {}
 
 
+class FakeNeverStableDelayedPlayClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._after_post = False
+        self._reads_after_post = 0
+
+    def _state(self, *, hand, enemy_hp):
+        return {
+            "state_type": "monster",
+            "player": {"hand": hand},
+            "battle": {
+                "enemies": [{"entity_id": "JAW_WORM_0", "name": "Jaw Worm", "hp": enemy_hp}],
+                "turn": "player",
+                "is_play_phase": True,
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        if not self._after_post:
+            return self._state(
+                hand=[{"index": 0, "name": "Strike", "description": "Deal 6 damage."}],
+                enemy_hp=40,
+            )
+        self._reads_after_post += 1
+        return self._state(hand=[], enemy_hp=40 - self._reads_after_post)
+
+    def post(self, body):
+        self.posts.append(body)
+        self._after_post = True
+        self._reads_after_post = 0
+        return {}
+
+
+class FakeDelayedAutoRewardClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._after_post = False
+        self._reads_after_post = 0
+
+    def _combat_state(self):
+        return {
+            "state_type": "boss",
+            "player": {
+                "hand": [
+                    {
+                        "index": 0,
+                        "name": "Thinking Ahead",
+                        "description": "Draw 2 cards. Put 1 card from your Hand on top of your Draw Pile. Exhaust.",
+                    }
+                ],
+                "potions": [],
+            },
+            "battle": {
+                "enemies": [{"entity_id": "BOSS_0", "name": "Boss", "hp": 13}],
+                "turn": "player",
+                "is_play_phase": True,
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        if not self._after_post:
+            return self._combat_state()
+        self._reads_after_post += 1
+        if self._reads_after_post <= 4:
+            state = self._combat_state()
+            state["player"]["hand"] = []
+            return state
+        return {
+            "state_type": "rewards",
+            "player": {"potions": []},
+            "rewards": {"items": [{"index": 0, "type": "gold"}], "can_proceed": True},
+        }
+
+    def post(self, body):
+        self.posts.append(body)
+        self._after_post = True
+        self._reads_after_post = 0
+        return {}
+
+
 class FakeStaleProceedClient:
     def __init__(self):
         self.posts = []
@@ -278,6 +381,7 @@ class FakeMapChoiceEarlyCombatClient:
             "player": {"potions": []},
             "map": {"next_options": [{"index": 0, "type": "Monster"}]},
         }
+        self._current = self._state
         self._states = []
 
     def _combat_state(self, *, hand, energy):
@@ -295,8 +399,8 @@ class FakeMapChoiceEarlyCombatClient:
     def state(self):
         self.state_calls += 1
         if self._states:
-            return self._states.pop(0)
-        return self._state
+            self._current = self._states.pop(0)
+        return self._current
 
     def post(self, body):
         self.posts.append(body)
@@ -320,13 +424,14 @@ class FakeMapChoiceEarlyEventClient:
             "player": {"potions": []},
             "map": {"next_options": [{"index": 0, "type": "Unknown"}]},
         }
+        self._current = self._state
         self._states = []
 
     def state(self):
         self.state_calls += 1
         if self._states:
-            return self._states.pop(0)
-        return self._state
+            self._current = self._states.pop(0)
+        return self._current
 
     def post(self, body):
         self.posts.append(body)
@@ -365,7 +470,7 @@ class FakeStaleEndTurnClient:
             hand=[{"index": 0, "name": "Strike", "description": "Deal 6 damage."}],
         )
 
-    def _combat_state(self, *, round_number, turn, hand, energy=0):
+    def _combat_state(self, *, round_number, turn, hand, energy=3):
         return {
             "state_type": "monster",
             "player": {"hp": 50, "block": 0, "energy": energy, "hand": hand},
@@ -417,6 +522,301 @@ class FakeEndTurnRewardsAfterEarlyReadyClient(FakeStaleEndTurnClient):
         return {}
 
 
+class FakeEndTurnEarlyRetainedCardClient(FakeStaleEndTurnClient):
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "end_turn":
+            early = self._combat_state(
+                round_number=2,
+                turn="player",
+                hand=[{"index": 0, "name": "Demon Form", "cost": "3"}],
+                energy=0,
+            )
+            ready = self._combat_state(
+                round_number=2,
+                turn="player",
+                hand=[
+                    {"index": 0, "name": "Demon Form", "cost": "3"},
+                    {"index": 1, "name": "Battle Trance+", "cost": "0"},
+                    {"index": 2, "name": "Shrug It Off+", "cost": "1"},
+                ],
+                energy=4,
+            )
+            self._states = [early, early, ready, ready]
+        return {}
+
+
+class FakeEndTurnEarlyPlayableRetainedCardClient(FakeStaleEndTurnClient):
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "end_turn":
+            early = self._combat_state(
+                round_number=2,
+                turn="player",
+                hand=[{"index": 0, "name": "Shrug It Off", "cost": "1"}],
+                energy=4,
+            )
+            ready = self._combat_state(
+                round_number=2,
+                turn="player",
+                hand=[
+                    {"index": 0, "name": "Shrug It Off", "cost": "1"},
+                    {"index": 1, "name": "Battle Trance+", "cost": "0"},
+                    {"index": 2, "name": "Strike", "cost": "1"},
+                    {"index": 3, "name": "Defend", "cost": "1"},
+                ],
+                energy=4,
+            )
+            self._states = [early] * 5 + [ready] * 3
+        return {}
+
+
+class FakeNeverStableEndTurnClient(FakeStaleEndTurnClient):
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "end_turn":
+            self._states = [
+                self._combat_state(
+                    round_number=2,
+                    turn="player",
+                    hand=[{"index": 0, "name": f"Strike {index}", "cost": "1"}],
+                    energy=3,
+                )
+                for index in range(8)
+            ]
+        return {}
+
+
+class FakeMapChoiceDelayedModalClient(FakeMapChoiceEarlyCombatClient):
+    def _card_select(self):
+        return {
+            "state_type": "card_select",
+            "player": {"hp": 50, "block": 0, "energy": 3, "hand": []},
+            "card_select": {
+                "prompt": "Choose one.",
+                "can_confirm": False,
+                "cards": [
+                    {"index": 0, "name": "Choice A"},
+                    {"index": 1, "name": "Choice B"},
+                ],
+            },
+        }
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "choose_map_node":
+            early = self._combat_state(
+                hand=[{"index": 0, "name": "Defend", "cost": "1"}],
+                energy=3,
+            )
+            modal = self._card_select()
+            self._states = [early] * 5 + [modal] * 3
+        return {}
+
+
+class FakeDelayedHandSelectAfterCardClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._states = []
+        self._current = self._combat_state(
+            hand=[
+                {
+                    "index": 0,
+                    "name": "Thinking Ahead",
+                    "cost": "0",
+                    "description": "Draw 2 cards. Put 1 card from your Hand on top of your Draw Pile. Exhaust.",
+                },
+                {"index": 1, "name": "Strike", "cost": "1", "description": "Deal 6 damage."},
+            ],
+        )
+
+    def _combat_state(self, *, hand):
+        return {
+            "state_type": "monster",
+            "player": {"hp": 50, "block": 0, "energy": 3, "hand": hand},
+            "battle": {
+                "round": 2,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "OWL_MAGISTRATE_0", "name": "Owl Magistrate", "hp": 184}],
+            },
+        }
+
+    def _hand_select(self):
+        return {
+            "state_type": "hand_select",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "hand": [
+                    {"index": 0, "name": "Bash", "cost": "2"},
+                    {"index": 1, "name": "Fisticuffs", "cost": "1"},
+                ],
+            },
+            "battle": {
+                "round": 2,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "OWL_MAGISTRATE_0", "name": "Owl Magistrate", "hp": 184}],
+            },
+            "hand_select": {
+                "mode": "simple_select",
+                "prompt": "Choose a card to put on top of your Draw Pile.",
+                "cards": [
+                    {"index": 0, "name": "Bash", "cost": "2"},
+                    {"index": 1, "name": "Fisticuffs", "cost": "1"},
+                ],
+                "can_confirm": False,
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        if self._states:
+            self._current = self._states.pop(0)
+        return self._current
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "play_card":
+            settled_too_early = self._combat_state(
+                hand=[
+                    {"index": 0, "name": "Bash", "cost": "2"},
+                    {"index": 1, "name": "Fisticuffs", "cost": "1"},
+                ],
+            )
+            modal = self._hand_select()
+            self._states = [settled_too_early] * 6 + [modal] * 3
+        return {}
+
+
+class FakePartialModalAfterCardClient(FakeDelayedHandSelectAfterCardClient):
+    def _partial_hand_select(self):
+        state = self._hand_select()
+        state["hand_select"]["cards"] = []
+        state["hand_select"]["prompt"] = "Choose a card..."
+        return state
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "play_card":
+            full = self._hand_select()
+            self._states = [self._partial_hand_select(), full, full]
+        return {}
+
+
+class FakeLongDelayedAutoRewardClient(FakeDelayedAutoRewardClient):
+    def _combat_state(self):
+        return {
+            "state_type": "monster",
+            "player": {
+                "hand": [
+                    {
+                        "index": 0,
+                        "name": "Battle Trance",
+                        "description": "Draw 3 cards. You cannot draw additional cards this turn.",
+                    }
+                ],
+                "potions": [],
+            },
+            "battle": {
+                "enemies": [{"entity_id": "OWL_MAGISTRATE_0", "name": "Owl Magistrate", "hp": 53}],
+                "turn": "player",
+                "is_play_phase": True,
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        if not self._after_post:
+            return self._combat_state()
+        self._reads_after_post += 1
+        if self._reads_after_post <= 8:
+            state = self._combat_state()
+            state["player"]["hand"] = [
+                {"index": 0, "name": "Thunderclap", "description": "Deal 4 damage to ALL enemies."},
+                {"index": 1, "name": "Flame Barrier", "description": "Gain 12 Block."},
+            ]
+            return state
+        return {
+            "state_type": "rewards",
+            "player": {"potions": []},
+            "rewards": {"items": [{"index": 0, "type": "gold"}], "can_proceed": True},
+        }
+
+
+class FakeDelayedPotionModalClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._states = []
+        self._current = {
+            "state_type": "monster",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "potions": [{"slot": 0, "name": "Skill Potion", "target_type": "Self"}],
+                "hand": [{"index": 0, "name": "Strike", "cost": "1"}],
+            },
+            "battle": {
+                "round": 1,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "CULTIST_0", "name": "Cultist", "hp": 20}],
+            },
+        }
+
+    def _combat_without_potion(self):
+        state = deepcopy(self._current)
+        state["player"]["potions"] = []
+        state["player"]["hand"] = [
+            {"index": 0, "name": "Strike", "cost": "1"},
+            {"index": 1, "name": "Defend", "cost": "1"},
+        ]
+        return state
+
+    def _card_select(self):
+        return {
+            "state_type": "card_select",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "potions": [],
+                "hand": [
+                    {"index": 0, "name": "Strike", "cost": "1"},
+                    {"index": 1, "name": "Defend", "cost": "1"},
+                ],
+            },
+            "card_select": {
+                "prompt": "Choose a card.",
+                "can_cancel": True,
+                "cards": [
+                    {"index": 0, "name": "Taunt"},
+                    {"index": 1, "name": "Impervious"},
+                    {"index": 2, "name": "Rage"},
+                ],
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        if self._states:
+            self._current = self._states.pop(0)
+        return self._current
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "use_potion":
+            stale_combat = self._combat_without_potion()
+            modal = self._card_select()
+            self._states = [stale_combat] * 8 + [modal, modal]
+        return {}
+
+
 class FakeDelayedCardSelectClient:
     def __init__(self):
         self.posts = []
@@ -451,6 +851,238 @@ class FakeDelayedCardSelectClient:
             self._stale_reads = 1
             self._state = self._card_select(can_confirm=True)
         return {}
+
+
+class FakeDelayedHandSelectClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._state = {
+            "state_type": "hand_select",
+            "player": {
+                "hp": 80,
+                "max_hp": 80,
+                "block": 0,
+                "energy": 4,
+                "gold": 114,
+                "potions": [],
+                "hand": [
+                    {"index": 0, "name": "Strike"},
+                    {"index": 1, "name": "Flame Barrier+"},
+                ],
+            },
+            "battle": {
+                "round": 1,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "DEVOTED_SCULPTOR_0", "name": "Devoted Sculptor", "hp": 162}],
+            },
+            "hand_select": {
+                "mode": "simple_select",
+                "prompt": "Choose a card to put on top of your Draw Pile.",
+                "cards": [
+                    {"index": 0, "name": "Strike", "cost": "1", "description": "Deal 6 damage."},
+                    {"index": 1, "name": "Flame Barrier+", "cost": "2", "description": "Gain 16 Block."},
+                ],
+                "can_confirm": False,
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        return self._state
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "combat_select_card":
+            self._state = {
+                "state_type": "monster",
+                "player": {
+                    "hp": 80,
+                    "max_hp": 80,
+                    "block": 0,
+                    "energy": 3,
+                    "gold": 114,
+                    "potions": [],
+                    "hand": [{"index": 0, "name": "Strike"}],
+                },
+                "battle": {
+                    "round": 1,
+                    "turn": "player",
+                    "is_play_phase": True,
+                    "enemies": [
+                        {"entity_id": "DEVOTED_SCULPTOR_0", "name": "Devoted Sculptor", "hp": 162}
+                    ],
+                },
+            }
+        return {}
+
+
+class FakeConfirmHandSelectionDelayedRewardClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._states = []
+        self._current = {
+            "state_type": "hand_select",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "hand": [{"index": 0, "name": "Bash"}],
+            },
+            "hand_select": {
+                "mode": "simple_select",
+                "prompt": "Choose a card to put on top of your Draw Pile.",
+                "selected_cards": [{"index": 0, "name": "Bash"}],
+                "cards": [{"index": 0, "name": "Bash"}],
+                "can_confirm": True,
+            },
+        }
+
+    def _combat_state(self):
+        return {
+            "state_type": "monster",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "hand": [{"index": 0, "name": "Thunderclap"}],
+            },
+            "battle": {
+                "round": 2,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "OWL_MAGISTRATE_0", "name": "Owl Magistrate", "hp": 12}],
+            },
+        }
+
+    def _rewards_state(self):
+        return {
+            "state_type": "rewards",
+            "player": {"potions": []},
+            "rewards": {"items": [{"index": 0, "type": "gold"}], "can_proceed": True},
+        }
+
+    def state(self):
+        self.state_calls += 1
+        if self._states:
+            self._current = self._states.pop(0)
+        return self._current
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "combat_confirm_selection":
+            self._states = [self._combat_state()] * 6 + [self._rewards_state()] * 3
+        return {}
+
+
+class FakeMenuStartRunClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self.endpoint = "singleplayer"
+        self.active_wait_id = None
+        self._state = self._main_menu()
+
+    def _main_menu(self):
+        return {
+            "state_type": "menu",
+            "menu_screen": "main",
+            "player": {"potions": []},
+            "options": ["singleplayer", "settings", "quit"],
+        }
+
+    def _singleplayer_menu(self):
+        return {
+            "state_type": "menu",
+            "menu_screen": "singleplayer",
+            "player": {"potions": []},
+            "options": [
+                {"name": "standard", "enabled": True},
+                {"name": "daily", "enabled": False},
+                {"name": "back", "enabled": True},
+            ],
+        }
+
+    def _character_select(self, *, confirm_enabled):
+        return {
+            "state_type": "menu",
+            "menu_screen": "character_select",
+            "player": {"potions": []},
+            "characters": [
+                {"id": "ironclad", "name": "Ironclad", "locked": False},
+                {"id": "silent", "name": "Silent", "locked": True},
+            ],
+            "options": [
+                {"name": "ironclad", "enabled": True},
+                {"name": "confirm", "enabled": confirm_enabled},
+                {"name": "back", "enabled": True},
+            ],
+        }
+
+    def _map_state(self):
+        return {
+            "state_type": "map",
+            "player": {"potions": [], "hp": 80, "max_hp": 80},
+            "run": {"act": 1, "floor": 0, "ascension": 0},
+            "map": {"next_options": [{"index": 0, "type": "Monster"}]},
+        }
+
+    def state(self):
+        self.state_calls += 1
+        return self._state
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] != "menu_select":
+            return {}
+        option = body["option"]
+        if option == "singleplayer":
+            self._state = self._singleplayer_menu()
+        elif option == "standard":
+            self._state = self._character_select(confirm_enabled=False)
+        elif option == "ironclad":
+            self._state = self._character_select(confirm_enabled=True)
+        elif option in {"confirm", "embark"}:
+            self._state = self._map_state()
+        return {"status": "ok"}
+
+
+class FakeNoChangeMenuClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._state = {
+            "state_type": "menu",
+            "menu_screen": "timeline",
+            "player": {"potions": []},
+            "options": [{"name": "advance", "enabled": True}],
+        }
+
+    def state(self):
+        self.state_calls += 1
+        return self._state
+
+    def post(self, body):
+        self.posts.append(body)
+        return {"status": "ok", "done": True, "message": "No more epochs to advance"}
+
+
+class FakeActiveRunClient:
+    def __init__(self):
+        self.endpoint = "singleplayer"
+        self.active_wait_id = None
+
+    def state(self):
+        return {
+            "state_type": "monster",
+            "player": {"potions": [], "hand": []},
+            "battle": {"turn": "player", "is_play_phase": True, "enemies": []},
+        }
+
+    def post(self, body):
+        return {"status": "ok"}
 
 
 def quiet_logger():
@@ -499,6 +1131,78 @@ class FastCliTests(unittest.TestCase):
 
         self.assertIsNone(body)
         self.assertIsNone(reason)
+
+    def test_next_trivial_action_leaves_spent_shop(self):
+        state = {
+            "state_type": "shop",
+            "player": {"potions": []},
+            "shop": {
+                "can_proceed": False,
+                "items": [
+                    {"index": 0, "is_stocked": True, "can_afford": False},
+                    {"index": 1, "is_stocked": False, "can_afford": False},
+                ],
+            },
+        }
+
+        body, reason = next_trivial_action(state)
+
+        self.assertEqual(body, {"action": "proceed"})
+        self.assertEqual(reason, "leave spent shop")
+
+    def test_drain_leaves_spent_shop_even_when_can_proceed_false(self):
+        fake = FakeClient(
+            {
+                "state_type": "shop",
+                "player": {"potions": []},
+                "shop": {
+                    "can_proceed": False,
+                    "items": [
+                        {"index": 0, "is_stocked": True, "can_afford": False},
+                        {"index": 1, "is_stocked": False, "can_afford": False},
+                    ],
+                },
+            }
+        )
+        stats = RunStats()
+
+        state, drained = drain_trivial(
+            fake,
+            logger=quiet_logger(),
+            stats=stats,
+            poll_delay=0,
+        )
+
+        self.assertEqual([item["reason"] for item in drained], ["leave spent shop", "choose only map node"])
+        self.assertEqual([post["action"] for post in fake.posts], ["proceed", "choose_map_node"])
+        self.assertEqual(state["state_type"], "monster")
+
+    def test_drain_keeps_shop_when_any_stocked_item_is_affordable(self):
+        fake = FakeClient(
+            {
+                "state_type": "shop",
+                "player": {"potions": []},
+                "shop": {
+                    "can_proceed": False,
+                    "items": [
+                        {"index": 0, "is_stocked": True, "can_afford": False},
+                        {"index": 1, "is_stocked": True, "can_afford": True},
+                    ],
+                },
+            }
+        )
+        stats = RunStats()
+
+        state, drained = drain_trivial(
+            fake,
+            logger=quiet_logger(),
+            stats=stats,
+            poll_delay=0,
+        )
+
+        self.assertEqual(drained, [])
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(state["state_type"], "shop")
 
     def test_drain_stops_on_card_reward_after_claiming_gold(self):
         fake = FakeClient(
@@ -645,14 +1349,81 @@ class FastCliTests(unittest.TestCase):
             auto_target=True,
             drain_after=False,
             wait_after_end_turn=True,
-            max_polls=1,
+            max_polls=2,
             poll_delay=0,
         )
 
         self.assertEqual([item["body"]["card_index"] for item in executed], [0, 1])
         self.assertTrue(all(item["body"]["target"] == "JAW_WORM_0" for item in executed))
         self.assertEqual([card["name"] for card in state["player"]["hand"]], ["Defend"])
-        self.assertEqual(fake.state_calls, 3)
+        self.assertEqual(fake.state_calls, 5)
+
+    def test_combat_actions_are_rejected_on_card_select_even_with_stale_hand(self):
+        fake = FakeClient(
+            {
+                "state_type": "card_select",
+                "player": {
+                    "hp": 50,
+                    "potions": [{"slot": 0, "name": "Skill Potion", "target_type": "Self"}],
+                    "hand": [
+                        {"index": 0, "name": "Shrug It Off+", "description": "Gain 11 Block. Draw 1 card."},
+                        {"index": 1, "name": "Strike", "description": "Deal 6 damage."},
+                    ],
+                },
+                "card_select": {
+                    "prompt": "Choose a card.",
+                    "can_cancel": True,
+                    "cards": [{"index": 0, "name": "Taunt"}],
+                },
+            }
+        )
+        stats = RunStats()
+
+        with self.assertRaisesRegex(RuntimeError, "resolve the current decision screen first"):
+            execute_actions(
+                fake,
+                [{"play": "Shrug It Off+"}],
+                logger=quiet_logger(),
+                stats=stats,
+                auto_target=True,
+                drain_after=False,
+                wait_after_end_turn=True,
+                max_polls=1,
+                poll_delay=0,
+            )
+
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(stats.actions, 0)
+
+    def test_end_turn_is_rejected_on_card_select(self):
+        fake = FakeClient(
+            {
+                "state_type": "card_select",
+                "player": {"hp": 50, "potions": [], "hand": [{"index": 0, "name": "Strike"}]},
+                "card_select": {
+                    "prompt": "Choose a card.",
+                    "can_cancel": True,
+                    "cards": [{"index": 0, "name": "Taunt"}],
+                },
+            }
+        )
+        stats = RunStats()
+
+        with self.assertRaisesRegex(RuntimeError, "Cannot end the turn"):
+            execute_actions(
+                fake,
+                [{"end_turn": True}],
+                logger=quiet_logger(),
+                stats=stats,
+                auto_target=True,
+                drain_after=False,
+                wait_after_end_turn=True,
+                max_polls=1,
+                poll_delay=0,
+            )
+
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(stats.actions, 0)
 
     def test_map_choice_waits_through_stale_transition_state(self):
         fake = FakeStaleMapChoiceClient()
@@ -666,7 +1437,7 @@ class FastCliTests(unittest.TestCase):
             auto_target=True,
             drain_after=False,
             wait_after_end_turn=True,
-            max_polls=3,
+            max_polls=12,
             poll_delay=0,
         )
 
@@ -685,7 +1456,7 @@ class FastCliTests(unittest.TestCase):
             auto_target=True,
             drain_after=False,
             wait_after_end_turn=True,
-            max_polls=3,
+            max_polls=12,
             poll_delay=0,
         )
 
@@ -693,6 +1464,29 @@ class FastCliTests(unittest.TestCase):
         self.assertEqual(state["state_type"], "monster")
         self.assertEqual(state["player"]["energy"], 3)
         self.assertEqual([card["name"] for card in state["player"]["hand"]], ["Strike"])
+
+    def test_map_choice_does_not_return_early_combat_before_delayed_modal(self):
+        fake = FakeMapChoiceDelayedModalClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"map": 0}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=12,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"], {"action": "choose_map_node", "index": 0})
+        self.assertEqual(state["state_type"], "card_select")
+        self.assertEqual(
+            [card["name"] for card in state["card_select"]["cards"]],
+            ["Choice A", "Choice B"],
+        )
 
     def test_map_choice_waits_until_event_options_are_ready(self):
         fake = FakeMapChoiceEarlyEventClient()
@@ -717,6 +1511,28 @@ class FastCliTests(unittest.TestCase):
             [{"index": 0, "title": "Share Knowledge"}],
         )
 
+    def test_mp_action_alias_switches_client_endpoint(self):
+        fake = FakeMapChoiceEarlyEventClient()
+        fake.endpoint = "singleplayer"
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"action": "mp_map_vote", "node_index": 0}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=3,
+            poll_delay=0,
+        )
+
+        self.assertEqual(fake.endpoint, "multiplayer")
+        self.assertEqual(executed[0]["body"], {"action": "choose_map_node", "index": 0})
+        self.assertEqual(state["state_type"], "event")
+        self.assertEqual(fake.state_calls, 2)
+
     def test_end_turn_waits_for_actual_next_ready_state(self):
         fake = FakeStaleEndTurnClient()
         stats = RunStats()
@@ -729,7 +1545,7 @@ class FastCliTests(unittest.TestCase):
             auto_target=True,
             drain_after=False,
             wait_after_end_turn=True,
-            max_polls=5,
+            max_polls=12,
             poll_delay=0,
         )
 
@@ -749,12 +1565,100 @@ class FastCliTests(unittest.TestCase):
             auto_target=True,
             drain_after=False,
             wait_after_end_turn=True,
-            max_polls=6,
+            max_polls=16,
             poll_delay=0,
         )
 
         self.assertEqual(executed[0]["body"], {"action": "end_turn"})
         self.assertEqual(state["state_type"], "rewards")
+
+    def test_end_turn_ignores_energy_zero_retained_card_transient(self):
+        fake = FakeEndTurnEarlyRetainedCardClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"end_turn": True}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=16,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"], {"action": "end_turn"})
+        self.assertEqual(state["player"]["energy"], 4)
+        self.assertEqual(
+            [card["name"] for card in state["player"]["hand"]],
+            ["Demon Form", "Battle Trance+", "Shrug It Off+"],
+        )
+
+    def test_end_turn_ignores_playable_retained_card_until_full_turn_settles(self):
+        fake = FakeEndTurnEarlyPlayableRetainedCardClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"end_turn": True}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=18,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"], {"action": "end_turn"})
+        self.assertEqual(state["player"]["energy"], 4)
+        self.assertEqual(
+            [card["name"] for card in state["player"]["hand"]],
+            ["Shrug It Off", "Battle Trance+", "Strike", "Defend"],
+        )
+
+    def test_end_turn_times_out_instead_of_returning_unsettled_state(self):
+        fake = FakeNeverStableEndTurnClient()
+        stats = RunStats()
+
+        with self.assertRaisesRegex(RuntimeError, "Timed out waiting for end turn"):
+            execute_actions(
+                fake,
+                [{"end_turn": True}],
+                logger=quiet_logger(),
+                stats=stats,
+                auto_target=True,
+                drain_after=False,
+                wait_after_end_turn=True,
+                max_polls=5,
+                poll_delay=0,
+            )
+
+        self.assertEqual(fake.posts, [{"action": "end_turn"}])
+
+    def test_skill_potion_waits_for_delayed_modal_selection(self):
+        fake = FakeDelayedPotionModalClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"potion": 0}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=20,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"], {"action": "use_potion", "slot": 0})
+        self.assertEqual(state["state_type"], "card_select")
+        self.assertEqual(
+            [card["name"] for card in state["card_select"]["cards"]],
+            ["Taunt", "Impervious", "Rage"],
+        )
 
     def test_play_card_waits_for_delayed_state_application(self):
         fake = FakeDelayedPlayClient()
@@ -801,6 +1705,111 @@ class FastCliTests(unittest.TestCase):
         wait = next(event for event in events if event["kind"] == "wait")
         self.assertEqual(wait["reason"], "card_play_settled")
 
+    def test_play_card_times_out_instead_of_returning_unsettled_state(self):
+        fake = FakeNeverStableDelayedPlayClient()
+        stats = RunStats()
+
+        with self.assertRaisesRegex(RuntimeError, "Timed out waiting for card play"):
+            execute_actions(
+                fake,
+                [{"action": "play_card", "card": "Strike"}],
+                logger=quiet_logger(),
+                stats=stats,
+                auto_target=True,
+                drain_after=False,
+                wait_after_end_turn=True,
+                max_polls=4,
+                poll_delay=0,
+            )
+
+        self.assertEqual(fake.posts[0]["action"], "play_card")
+
+    def test_draw_or_auto_effect_card_waits_for_extra_settle_state_change(self):
+        fake = FakeDelayedAutoRewardClient()
+        stats = RunStats()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delayed-auto-reward.jsonl"
+            state, executed = execute_actions(
+                fake,
+                [{"action": "play_card", "card": "Thinking Ahead"}],
+                logger=JsonlLogger(path),
+                stats=stats,
+                auto_target=True,
+                drain_after=False,
+                wait_after_end_turn=True,
+                max_polls=8,
+                poll_delay=0,
+            )
+            events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(executed[0]["body"]["card_index"], 0)
+        self.assertEqual(state["state_type"], "rewards")
+        wait = next(event for event in events if event["kind"] == "wait")
+        self.assertEqual(wait["reason"], "card_play_state_changed_settled")
+        self.assertGreaterEqual(wait["polls"], 5)
+
+    def test_card_play_waits_for_delayed_hand_select_after_combat_looking_state(self):
+        fake = FakeDelayedHandSelectAfterCardClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"action": "play_card", "card": "Thinking Ahead"}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=14,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"]["card_index"], 0)
+        self.assertEqual(state["state_type"], "hand_select")
+        self.assertEqual(state["hand_select"]["prompt"], "Choose a card to put on top of your Draw Pile.")
+
+    def test_card_play_waits_for_partial_modal_state_to_fill_in(self):
+        fake = FakePartialModalAfterCardClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"action": "play_card", "card": "Thinking Ahead"}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=6,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"]["card_index"], 0)
+        self.assertEqual(state["state_type"], "hand_select")
+        self.assertEqual(
+            [card["name"] for card in state["hand_select"]["cards"]],
+            ["Bash", "Fisticuffs"],
+        )
+
+    def test_draw_auto_effect_card_waits_for_late_reward_transition(self):
+        fake = FakeLongDelayedAutoRewardClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"action": "play_card", "card": "Battle Trance"}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=16,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"]["card_index"], 0)
+        self.assertEqual(state["state_type"], "rewards")
+
     def test_documented_play_shorthand_preserves_target_field(self):
         self.assertEqual(
             normalize_action({"play": "Uppercut+", "target": "first"}),
@@ -816,11 +1825,129 @@ class FastCliTests(unittest.TestCase):
             {"action": "deck_select_card", "index": 4},
         )
 
+    def test_mcp_tool_action_aliases_normalize_to_http_actions(self):
+        self.assertEqual(
+            normalize_action({"action": "rewards_claim", "reward_index": 2}),
+            {"reward_index": 2, "action": "claim_reward", "index": 2},
+        )
+        self.assertEqual(
+            normalize_action({"action": "map_choose_node", "node_index": 1}),
+            {"node_index": 1, "action": "choose_map_node", "index": 1},
+        )
+        self.assertEqual(
+            normalize_action({"action": "mp_rewards_pick_card", "card_index": 2}),
+            {
+                "card_index": 2,
+                "action": "select_card_reward",
+                "_endpoint": "multiplayer",
+                "_wait": False,
+            },
+        )
+        self.assertEqual(
+            normalize_action("mp_combat_undo_end_turn"),
+            {"action": "undo_end_turn", "_endpoint": "multiplayer", "_wait": False},
+        )
+
+    def test_menu_shorthand_normalizes_to_menu_select(self):
+        self.assertEqual(
+            normalize_action({"menu": "singleplayer"}),
+            {"action": "menu_select", "option": "singleplayer"},
+        )
+
     def test_cards_parser_accepts_wait_budget_flags(self):
         args = build_parser().parse_args(["cards", "Strike", "--max-polls", "80"])
 
         self.assertEqual(args.command, "cards")
         self.assertEqual(args.max_polls, 80)
+
+    def test_parser_fast_polling_defaults_are_explicit(self):
+        self.assertEqual(DEFAULT_POLL_DELAY, 0.04)
+        self.assertEqual(DEFAULT_INITIAL_POLL_DELAY, 0.015)
+        self.assertEqual(DEFAULT_MAX_POLLS, 120)
+        self.assertEqual(DEFAULT_MENU_MAX_POLLS, 120)
+        self.assertEqual(DEFAULT_START_RUN_MAX_POLLS, 160)
+        self.assertEqual(DELAYED_CARD_SETTLE_POLLS, 8)
+        self.assertEqual(SELECTION_CARD_SETTLE_POLLS, 6)
+        self.assertEqual(START_TURN_SETTLE_POLLS, 8)
+        self.assertEqual(MAP_COMBAT_SETTLE_POLLS, 8)
+
+        args = build_parser().parse_args(["act", '[{"end_turn":true}]'])
+        self.assertEqual(args.poll_delay, DEFAULT_POLL_DELAY)
+        self.assertEqual(args.max_polls, DEFAULT_MAX_POLLS)
+
+        args = build_parser().parse_args(["cards", "Strike"])
+        self.assertEqual(args.poll_delay, DEFAULT_POLL_DELAY)
+        self.assertEqual(args.max_polls, DEFAULT_MAX_POLLS)
+
+        args = build_parser().parse_args(["menu", "main_menu"])
+        self.assertEqual(args.poll_delay, DEFAULT_POLL_DELAY)
+        self.assertEqual(args.max_polls, DEFAULT_MENU_MAX_POLLS)
+
+        args = build_parser().parse_args(["start-run"])
+        self.assertEqual(args.poll_delay, DEFAULT_POLL_DELAY)
+        self.assertEqual(args.max_polls, DEFAULT_START_RUN_MAX_POLLS)
+
+    def test_parser_accepts_menu_start_and_profile_commands(self):
+        args = build_parser().parse_args(["menu", "singleplayer", "--no-wait"])
+        self.assertEqual(args.command, "menu")
+        self.assertTrue(args.no_wait)
+
+        args = build_parser().parse_args(["map"])
+        self.assertEqual(args.command, "map")
+
+        args = build_parser().parse_args(["start-run", "--character", "first"])
+        self.assertEqual(args.command, "start-run")
+        self.assertEqual(args.character, "first")
+
+        args = build_parser().parse_args(["wiki", "perfected strike", "--item-type", "card"])
+        self.assertEqual(args.command, "wiki")
+        self.assertEqual(args.item_type, "card")
+
+        args = build_parser().parse_args(["--multiplayer", "state", "--raw-format", "markdown"])
+        self.assertTrue(args.multiplayer)
+        self.assertEqual(args.raw_format, "markdown")
+
+    def test_act_map_data_returns_whole_map_graph(self):
+        data = act_map_data(
+            {
+                "state_type": "map",
+                "run": {"act": 3, "floor": 34},
+                "player": {
+                    "hp": 80,
+                    "max_hp": 80,
+                    "gold": 114,
+                    "potions": [{"slot": 0, "name": "Skill Potion", "target_type": "Self"}],
+                    "relics": [{"name": "Lantern"}, {"name": "Choices Paradox"}],
+                },
+                "map": {
+                    "current_position": {"col": 3, "row": 0, "type": "Ancient"},
+                    "visited": [{"col": 3, "row": 0, "type": "Ancient"}],
+                    "next_options": [{"index": 1, "col": 6, "row": 1, "type": "Monster"}],
+                    "boss": {"col": 3, "row": 14, "id": "QUEEN_BOSS", "name": "Queen"},
+                    "bosses": [{"col": 3, "row": 14, "id": "QUEEN_BOSS", "name": "Queen"}],
+                    "nodes": [
+                        {
+                            "col": 3,
+                            "row": 0,
+                            "type": "Ancient",
+                            "children": [[6, 1]],
+                            "extra": "preserved",
+                        },
+                        {"col": 6, "row": 1, "type": "Monster", "children": []},
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(data["run"]["act"], 3)
+        self.assertEqual(data["player"]["relics"], ["Lantern", "Choices Paradox"])
+        self.assertEqual(data["next_options"][0]["index"], 1)
+        self.assertEqual(data["nodes"][0]["extra"], "preserved")
+        self.assertEqual(data["boss"]["name"], "Queen")
+
+    def test_act_map_data_requires_map_nodes(self):
+        with self.assertRaisesRegex(RuntimeError, "Whole act map is not available"):
+            act_map_data({"state_type": "monster", "player": {}, "battle": {}})
 
     def test_post_error_body_raises(self):
         with self.assertRaisesRegex(RuntimeError, "Missing 'card_index'"):
@@ -922,6 +2049,153 @@ class FastCliTests(unittest.TestCase):
 
         self.assertEqual(executed[0]["body"], {"action": "select_card", "index": 1})
         self.assertTrue(state["card_select"]["can_confirm"])
+
+    def test_hand_select_state_is_summarized_and_classified(self):
+        state = FakeDelayedHandSelectClient().state()
+
+        summary = summarize_state(state)
+        point = decision_point(state)
+
+        self.assertEqual(summary["state_type"], "hand_select")
+        self.assertEqual(summary["hand_select"]["prompt"], "Choose a card to put on top of your Draw Pile.")
+        self.assertEqual(
+            [card["name"] for card in summary["hand_select"]["cards"]],
+            ["Strike", "Flame Barrier+"],
+        )
+        self.assertFalse(summary["hand_select"]["can_confirm"])
+        self.assertEqual(point["kind"], "hand_select")
+        self.assertEqual(point["option_count"], 2)
+        self.assertFalse(point["can_confirm"])
+
+    def test_hand_selection_alias_uses_current_mod_compatible_http_action(self):
+        body, _ = action_body_from_plan(
+            FakeDelayedHandSelectClient(),
+            {"action": "hand_select", "index": 1},
+            auto_target=True,
+        )
+
+        self.assertEqual(body, {"action": "combat_select_card", "card_index": 1})
+
+        body, _ = action_body_from_plan(
+            FakeDelayedHandSelectClient(),
+            {"action": "combat_select_card", "card_index": 1},
+            auto_target=True,
+        )
+
+        self.assertEqual(body, {"action": "combat_select_card", "card_index": 1})
+
+    def test_hand_selection_alias_waits_for_state_change(self):
+        fake = FakeDelayedHandSelectClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"hand_select": 1}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=12,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"], {"action": "combat_select_card", "card_index": 1})
+        self.assertEqual(state["state_type"], "monster")
+        self.assertEqual([card["name"] for card in state["player"]["hand"]], ["Strike"])
+
+    def test_hand_selection_confirm_waits_for_late_reward_transition(self):
+        fake = FakeConfirmHandSelectionDelayedRewardClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"action": "confirm_hand_selection"}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=14,
+            poll_delay=0,
+        )
+
+        self.assertEqual(executed[0]["body"], {"action": "combat_confirm_selection"})
+        self.assertEqual(state["state_type"], "rewards")
+
+    def test_choose_character_option_matches_unlocked_character(self):
+        state = FakeMenuStartRunClient()._character_select(confirm_enabled=False)
+
+        self.assertEqual(choose_character_option(state, "Ironclad"), "ironclad")
+        self.assertEqual(choose_character_option(state, "first"), "ironclad")
+        with self.assertRaisesRegex(RuntimeError, "not available"):
+            choose_character_option(state, "silent")
+
+    def test_start_run_walks_main_menu_to_run_state(self):
+        fake = FakeMenuStartRunClient()
+        stats = RunStats()
+
+        state, executed = start_run(
+            fake,
+            logger=quiet_logger(),
+            stats=stats,
+            mode="standard",
+            character="ironclad",
+            seed=None,
+            max_steps=8,
+            max_polls=3,
+            poll_delay=0,
+        )
+
+        self.assertEqual(state["state_type"], "map")
+        self.assertEqual(
+            [step["body"]["option"] for step in executed],
+            ["singleplayer", "standard", "ironclad", "confirm"],
+        )
+        self.assertEqual(stats.actions, 4)
+
+    def test_start_run_refuses_active_run_state(self):
+        with self.assertRaisesRegex(RuntimeError, "Cannot start a run"):
+            start_run(
+                FakeActiveRunClient(),
+                logger=quiet_logger(),
+                stats=RunStats(),
+                mode="standard",
+                character="ironclad",
+                seed=None,
+                max_steps=8,
+                max_polls=3,
+                poll_delay=0,
+            )
+
+    def test_menu_option_can_return_valid_no_change_status(self):
+        fake = FakeNoChangeMenuClient()
+
+        state, executed = execute_menu_option(
+            fake,
+            "advance",
+            logger=quiet_logger(),
+            stats=RunStats(),
+            max_polls=2,
+            poll_delay=0,
+        )
+
+        self.assertEqual(state["menu_screen"], "timeline")
+        self.assertEqual(executed["result"]["done"], True)
+
+    def test_menu_option_require_change_preserves_startup_strictness(self):
+        fake = FakeNoChangeMenuClient()
+
+        with self.assertRaisesRegex(RuntimeError, "Timed out waiting"):
+            execute_menu_option(
+                fake,
+                "advance",
+                logger=quiet_logger(),
+                stats=RunStats(),
+                require_change=True,
+                max_polls=2,
+                poll_delay=0,
+            )
 
     def test_explicit_target_hint_is_ignored_for_non_target_card(self):
         fake = FakeClient(
@@ -1113,6 +2387,45 @@ class FastCliTests(unittest.TestCase):
             },
         )
 
+    def test_crystal_sphere_state_is_summarized_and_classified(self):
+        state = {
+            "state_type": "crystal_sphere",
+            "player": {"potions": []},
+            "crystal_sphere": {
+                "grid_width": 3,
+                "grid_height": 2,
+                "tool": "small",
+                "can_use_big_tool": True,
+                "can_use_small_tool": True,
+                "can_proceed": False,
+                "clickable_cells": [{"x": 1, "y": 0}],
+                "revealed_items": [{"item_type": "GoodThing", "x": 0, "y": 0, "is_good": True}],
+            },
+        }
+
+        summary = summarize_state(state)
+        point = decision_point(state)
+        body, reason = next_trivial_action(state)
+
+        self.assertEqual(summary["crystal_sphere"]["tool"], "small")
+        self.assertEqual(summary["crystal_sphere"]["clickable_cells"], [{"x": 1, "y": 0}])
+        self.assertEqual(point["kind"], "crystal_sphere")
+        self.assertEqual(point["clickable_count"], 1)
+        self.assertIsNone(body)
+        self.assertIsNone(reason)
+
+    def test_completed_crystal_sphere_is_drainable(self):
+        body, reason = next_trivial_action(
+            {
+                "state_type": "crystal_sphere",
+                "player": {"potions": []},
+                "crystal_sphere": {"can_proceed": True, "clickable_cells": []},
+            }
+        )
+
+        self.assertEqual(body, {"action": "crystal_sphere_proceed"})
+        self.assertEqual(reason, "leave completed crystal sphere")
+
     def test_state_delta_counts_removed_enemy_remaining_hp_as_damage(self):
         before = {
             "state_type": "monster",
@@ -1188,6 +2501,7 @@ class FastCliTests(unittest.TestCase):
                     "kind": "http",
                     "method": "GET",
                     "path": "/api/v1/singleplayer",
+                    "wait_id": "wait-0001",
                     "status_code": 200,
                     "elapsed_ms": 12.4,
                 },
@@ -1195,6 +2509,7 @@ class FastCliTests(unittest.TestCase):
                     "seq": 3,
                     "ts": "2026-06-22T10:00:00.120-07:00",
                     "kind": "wait",
+                    "wait_id": "wait-0001",
                     "reason": "ready_state",
                     "polls": 2,
                     "elapsed_ms": 87.5,
@@ -1220,6 +2535,13 @@ class FastCliTests(unittest.TestCase):
                     "kind": "state_result",
                     "decision_point": {"kind": "combat_turn"},
                 },
+                {
+                    "seq": 6,
+                    "ts": "2026-06-22T10:00:00.250-07:00",
+                    "kind": "stdout",
+                    "bytes": 123,
+                    "lines": 3,
+                },
             ]
             path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
 
@@ -1228,6 +2550,14 @@ class FastCliTests(unittest.TestCase):
         self.assertEqual(summary["event_kinds"]["action_result"], 1)
         self.assertEqual(summary["waits"]["reasons"], {"ready_state": 1})
         self.assertEqual(summary["waits"]["elapsed_ms"]["total_ms"], 87.5)
+        self.assertEqual(
+            summary["waits"]["http_by_wait_id"],
+            {"wait-0001": {"count": 1, "elapsed_ms": 12.4}},
+        )
+        self.assertEqual(summary["timing_breakdown"]["wait_http_overlap_ms"], 12.4)
+        self.assertEqual(summary["timing_breakdown"]["wait_non_http_ms"], 75.1)
+        self.assertEqual(summary["timing_breakdown"]["local_overhead_ms"], 162.5)
+        self.assertEqual(summary["stdout"], {"writes": 1, "bytes": 123, "lines": 3})
         self.assertEqual(summary["decision_points"], {"combat_turn": 1})
         self.assertEqual(summary["decision_point_events"], {"combat_turn": 2})
         self.assertEqual(summary["decision_points_by_phase"]["after"], {"combat_turn": 2})
@@ -1426,6 +2756,59 @@ class FastCliTests(unittest.TestCase):
             second.write_text("", encoding="utf-8")
 
             self.assertEqual(expand_log_path_args([str(Path(tmp) / "*.jsonl")]), [first, second])
+
+    def test_expand_log_path_args_dedupes_relative_and_repo_root_globs(self):
+        path = output_log_path("logs/sts2-fast/test-dedupe.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        try:
+            self.assertEqual(
+                expand_log_path_args(["logs/sts2-fast/test-dedupe*.jsonl"]),
+                [path],
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_expand_log_path_args_rejects_empty_globs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "matched no files"):
+                expand_log_path_args([str(Path(tmp) / "*.jsonl")])
+
+    def test_output_log_path_resolves_relative_paths_from_repo_root(self):
+        path = output_log_path("logs/sts2-fast/test.jsonl")
+
+        self.assertTrue(path.is_absolute())
+        self.assertTrue(str(path).endswith("STS2MCP/logs/sts2-fast/test.jsonl"))
+
+    def test_emit_result_logs_stdout_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "stdout.jsonl"
+            logger = JsonlLogger(log_path)
+            stats = RunStats()
+            state = {
+                "state_type": "menu",
+                "player": {"hp": 80, "max_hp": 80, "potions": []},
+            }
+
+            captured = StringIO()
+            with redirect_stdout(captured):
+                emit_result(
+                    ok=True,
+                    stats=stats,
+                    log_path=log_path,
+                    logger=logger,
+                    state=state,
+                    indent=None,
+                )
+
+            payload = captured.getvalue()
+            rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertGreater(stats.stdout_bytes, 0)
+        self.assertEqual(stats.stdout_writes, 1)
+        self.assertEqual(stats.stdout_bytes, len(payload.encode("utf-8")))
+        self.assertEqual(rows[0]["kind"], "stdout")
+        self.assertEqual(rows[0]["bytes"], stats.stdout_bytes)
 
 
 if __name__ == "__main__":

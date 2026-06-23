@@ -11,6 +11,7 @@ import argparse
 import glob
 import json
 import os
+import platform
 import sys
 import time
 from collections import Counter
@@ -25,6 +26,18 @@ import httpx
 
 COMBAT_STATES = {"monster", "elite", "boss"}
 DEFAULT_BASE_URL = "http://127.0.0.1:15526"
+DEFAULT_POLL_DELAY = 0.04
+DEFAULT_INITIAL_POLL_DELAY = 0.015
+DEFAULT_MAX_POLLS = 120
+DEFAULT_MENU_MAX_POLLS = 120
+DEFAULT_START_RUN_MAX_POLLS = 160
+DEFAULT_PROFILE_POLL_DELAY = 0.08
+READY_STATE_SETTLE_POLLS = 2
+DELAYED_CARD_SETTLE_POLLS = 8
+SELECTION_CARD_SETTLE_POLLS = 6
+START_TURN_SETTLE_POLLS = 8
+MAP_COMBAT_SETTLE_POLLS = 8
+SELECTION_POTION_SETTLE_POLLS = 8
 
 
 def _now_iso() -> str:
@@ -38,6 +51,36 @@ def _repo_root() -> Path:
 def _default_log_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     return _repo_root() / "logs" / "sts2-fast" / f"{stamp}-{os.getpid()}.jsonl"
+
+
+def _git_dir() -> Path | None:
+    git_path = _repo_root() / ".git"
+    if git_path.is_dir():
+        return git_path
+    if git_path.is_file():
+        text = git_path.read_text(encoding="utf-8", errors="replace").strip()
+        prefix = "gitdir:"
+        if text.startswith(prefix):
+            return (_repo_root() / text[len(prefix):].strip()).resolve()
+    return None
+
+
+def _git_head_sha() -> str | None:
+    git_dir = _git_dir()
+    if git_dir is None:
+        return None
+    head_path = git_dir / "HEAD"
+    try:
+        head = head_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if head.startswith("ref:"):
+        ref_path = git_dir / head.split(":", 1)[1].strip()
+        try:
+            return ref_path.read_text(encoding="utf-8").strip()[:12]
+        except OSError:
+            return None
+    return head[:12] if head else None
 
 
 def _json_dumps(data: Any, *, indent: int | None = None) -> str:
@@ -56,8 +99,13 @@ class JsonlLogger:
     def __init__(self, path: Path | None):
         self.path = path
         self.seq = 0
+        self.wait_seq = 0
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
+
+    def next_wait_id(self) -> str:
+        self.wait_seq += 1
+        return f"wait-{self.wait_seq:04d}"
 
     def write(self, kind: str, **data: Any) -> None:
         if self.path is None:
@@ -81,6 +129,9 @@ class RunStats:
     actions: int = 0
     drains: int = 0
     http_elapsed_ms: float = 0.0
+    stdout_bytes: int = 0
+    stdout_lines: int = 0
+    stdout_writes: int = 0
     started_at: float = field(default_factory=time.perf_counter)
 
     def as_dict(self) -> dict[str, Any]:
@@ -93,6 +144,9 @@ class RunStats:
             "post_calls": self.post_calls,
             "actions": self.actions,
             "drain_actions": self.drains,
+            "stdout_bytes": self.stdout_bytes,
+            "stdout_lines": self.stdout_lines,
+            "stdout_writes": self.stdout_writes,
         }
 
 
@@ -101,14 +155,17 @@ class STS2Client:
         self,
         *,
         base_url: str,
+        endpoint: str = "singleplayer",
         logger: JsonlLogger,
         stats: RunStats,
         timeout: float,
         trust_env: bool,
     ):
         self.base_url = base_url.rstrip("/")
+        self.endpoint = endpoint
         self.logger = logger
         self.stats = stats
+        self.active_wait_id: str | None = None
         self.http = httpx.Client(
             timeout=httpx.Timeout(timeout, connect=2.0),
             trust_env=trust_env,
@@ -155,6 +212,7 @@ class STS2Client:
                 method=method.upper(),
                 path=path,
                 started_ts=started_ts,
+                wait_id=self.active_wait_id,
                 params=params,
                 action=json_body.get("action") if json_body else None,
                 status_code=status_code,
@@ -163,17 +221,79 @@ class STS2Client:
                 error=error,
             )
 
+    def run_path(self) -> str:
+        if self.endpoint == "multiplayer":
+            return "/api/v1/multiplayer"
+        return "/api/v1/singleplayer"
+
     def state(self) -> dict[str, Any]:
-        data = self._request("GET", "/api/v1/singleplayer", params={"format": "json"})
+        data = self._request("GET", self.run_path(), params={"format": "json"})
         if not isinstance(data, dict):
             raise RuntimeError("Expected JSON object from game state")
         return data
 
+    def state_text(self, *, format_name: str) -> str:
+        return self._request_text("GET", self.run_path(), params={"format": format_name})
+
     def post(self, body: dict[str, Any]) -> dict[str, Any]:
-        data = self._request("POST", "/api/v1/singleplayer", json_body=body)
+        data = self._request("POST", self.run_path(), json_body=body)
         result = data if isinstance(data, dict) else {}
         validate_post_response(result, body)
         return result
+
+    def get_json(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
+        return self._request("GET", path, params=params)
+
+    def post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        data = self._request("POST", path, json_body=body)
+        result = data if isinstance(data, dict) else {}
+        validate_post_response(result, body)
+        return result
+
+    def _request_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> str:
+        url = f"{self.base_url}{path}"
+        started = time.perf_counter()
+        started_ts = _now_iso()
+        status_code: int | None = None
+        response_text = ""
+        error: str | None = None
+        try:
+            response = self.http.request(method, url, params=params, json=json_body)
+            status_code = response.status_code
+            response_text = response.text
+            response.raise_for_status()
+            return response_text
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self.stats.http_calls += 1
+            self.stats.http_elapsed_ms += elapsed_ms
+            if method.upper() == "GET":
+                self.stats.get_calls += 1
+            elif method.upper() == "POST":
+                self.stats.post_calls += 1
+            self.logger.write(
+                "http",
+                method=method.upper(),
+                path=path,
+                started_ts=started_ts,
+                wait_id=self.active_wait_id,
+                params=params,
+                action=json_body.get("action") if json_body else None,
+                status_code=status_code,
+                elapsed_ms=round(elapsed_ms, 1),
+                response_bytes=len(response_text.encode("utf-8")),
+                error=error,
+            )
 
 
 def validate_post_response(result: dict[str, Any], body: dict[str, Any]) -> None:
@@ -231,7 +351,29 @@ def summarize_state(state: dict[str, Any], *, verbose: bool = False) -> dict[str
         ]
 
     state_type = state.get("state_type")
-    if state_type in COMBAT_STATES:
+    if state_type == "menu":
+        summary["menu"] = {
+            "screen": state.get("menu_screen"),
+            "message": state.get("message"),
+            "options": state.get("options") or [],
+            "blocked_options": state.get("blocked_options") or [],
+        }
+        if state.get("menu_screen") == "character_select":
+            summary["menu"]["characters"] = [
+                {
+                    "id": c.get("id"),
+                    "name": c.get("name"),
+                    "locked": c.get("locked"),
+                    "hp": c.get("hp"),
+                    "gold": c.get("gold"),
+                    "energy": c.get("energy"),
+                }
+                for c in state.get("characters") or []
+                if isinstance(c, dict)
+            ]
+        if "lobby" in state:
+            summary["menu"]["lobby"] = state.get("lobby")
+    elif state_type in COMBAT_STATES:
         battle = state.get("battle") or {}
         summary["combat"] = {
             "round": battle.get("round"),
@@ -318,14 +460,122 @@ def summarize_state(state: dict[str, Any], *, verbose: bool = False) -> dict[str
                 if isinstance(c, dict)
             ],
         }
+    elif state_type == "hand_select":
+        hand_select = state.get("hand_select") or {}
+        summary["hand_select"] = {
+            "mode": hand_select.get("mode"),
+            "prompt": hand_select.get("prompt"),
+            "can_confirm": hand_select.get("can_confirm"),
+            "selected_cards": hand_select.get("selected_cards") or [],
+            "cards": [
+                {
+                    "index": c.get("index"),
+                    "name": c.get("name"),
+                    "cost": c.get("cost"),
+                    "type": c.get("type"),
+                    "description": c.get("description"),
+                }
+                for c in hand_select.get("cards") or []
+                if isinstance(c, dict)
+            ],
+        }
     elif state_type == "bundle_select":
         summary["bundle_select"] = state.get("bundle_select") or {}
     elif state_type == "relic_select":
         summary["relic_select"] = state.get("relic_select") or {}
+    elif state_type == "crystal_sphere":
+        crystal = state.get("crystal_sphere") or {}
+        summary["crystal_sphere"] = {
+            "instructions_title": crystal.get("instructions_title"),
+            "instructions_description": crystal.get("instructions_description"),
+            "grid_width": crystal.get("grid_width"),
+            "grid_height": crystal.get("grid_height"),
+            "tool": crystal.get("tool"),
+            "can_use_big_tool": crystal.get("can_use_big_tool"),
+            "can_use_small_tool": crystal.get("can_use_small_tool"),
+            "divinations_left_text": crystal.get("divinations_left_text"),
+            "can_proceed": crystal.get("can_proceed"),
+            "clickable_cells": crystal.get("clickable_cells") or [],
+            "revealed_items": crystal.get("revealed_items") or [],
+        }
     elif state_type in {"shop", "fake_merchant"}:
         summary[state_type] = state.get("shop") or state.get("fake_merchant") or {}
 
     return summary
+
+
+def act_map_data(state: dict[str, Any]) -> dict[str, Any]:
+    map_data = state.get("map")
+    if not isinstance(map_data, dict) or not isinstance(map_data.get("nodes"), list):
+        state_type = state.get("state_type")
+        raise RuntimeError(
+            "Whole act map is not available in current state; "
+            f"state_type={state_type!r}. Read it from a map screen."
+        )
+
+    player = state.get("player") or {}
+    return {
+        "state_type": state.get("state_type"),
+        "run": state.get("run"),
+        "player": {
+            "hp": player.get("hp"),
+            "max_hp": player.get("max_hp"),
+            "gold": player.get("gold"),
+            "potions": [
+                {
+                    "slot": potion.get("slot"),
+                    "name": potion.get("name"),
+                    "target_type": potion.get("target_type"),
+                }
+                for potion in player.get("potions") or []
+                if isinstance(potion, dict)
+            ],
+            "relics": [
+                relic.get("name")
+                for relic in player.get("relics") or []
+                if isinstance(relic, dict)
+            ],
+        },
+        "current_position": map_data.get("current_position"),
+        "visited": map_data.get("visited") or [],
+        "next_options": map_data.get("next_options") or [],
+        "boss": map_data.get("boss"),
+        "bosses": map_data.get("bosses") or [],
+        "nodes": map_data.get("nodes") or [],
+    }
+
+
+def normalize_menu_options(options: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for option in options:
+        if isinstance(option, str):
+            normalized.append({"name": option, "enabled": True})
+        elif isinstance(option, dict):
+            normalized.append(
+                {
+                    "name": option.get("name") or option.get("title"),
+                    "enabled": option.get("enabled", not option.get("is_locked", False)),
+                    "reason": option.get("reason"),
+                }
+            )
+    return normalized
+
+
+def menu_option_names(state: dict[str, Any], *, enabled_only: bool = True) -> list[str]:
+    names: list[str] = []
+    for option in normalize_menu_options(state.get("options") or []):
+        name = option.get("name")
+        if not name:
+            continue
+        if enabled_only and option.get("enabled") is False:
+            continue
+        names.append(str(name))
+    return names
+
+
+def menu_option_enabled(state: dict[str, Any], option_name: str) -> bool:
+    wanted = option_name.casefold()
+    return any(name.casefold() == wanted for name in menu_option_names(state, enabled_only=True))
 
 
 def state_digest(state: dict[str, Any]) -> dict[str, Any]:
@@ -350,7 +600,42 @@ def state_digest(state: dict[str, Any]) -> dict[str, Any]:
         },
     }
     state_type = state.get("state_type")
-    if state_type in COMBAT_STATES:
+    if state_type == "menu":
+        digest["menu"] = {
+            "screen": state.get("menu_screen"),
+            "message": state.get("message"),
+            "options": normalize_menu_options(state.get("options") or []),
+            "blocked_options": normalize_menu_options(state.get("blocked_options") or []),
+        }
+        if state.get("menu_screen") == "character_select":
+            digest["menu"]["characters"] = [
+                {
+                    "id": character.get("id"),
+                    "name": character.get("name"),
+                    "locked": character.get("locked"),
+                }
+                for character in state.get("characters") or []
+                if isinstance(character, dict)
+            ]
+        if isinstance(state.get("lobby"), dict):
+            lobby = state["lobby"]
+            digest["menu"]["lobby"] = {
+                "type": lobby.get("type"),
+                "game_mode": lobby.get("game_mode"),
+                "all_ready": lobby.get("all_ready"),
+                "is_about_to_begin": lobby.get("is_about_to_begin"),
+                "is_local_ready": lobby.get("is_local_ready"),
+                "players": [
+                    {
+                        "id": player.get("id"),
+                        "character_id": player.get("character_id"),
+                        "is_ready": player.get("is_ready"),
+                    }
+                    for player in lobby.get("players") or []
+                    if isinstance(player, dict)
+                ],
+            }
+    elif state_type in COMBAT_STATES:
         battle = state.get("battle") or {}
         digest["combat"] = {
             "round": battle.get("round"),
@@ -454,6 +739,53 @@ def state_digest(state: dict[str, Any]) -> dict[str, Any]:
                 }
                 for card in card_select.get("cards") or []
                 if isinstance(card, dict)
+            ],
+        }
+    elif state_type == "hand_select":
+        hand_select = state.get("hand_select") or {}
+        digest["hand_select"] = {
+            "mode": hand_select.get("mode"),
+            "prompt": hand_select.get("prompt"),
+            "can_confirm": hand_select.get("can_confirm"),
+            "selected_cards": [
+                {
+                    "index": card.get("index"),
+                    "name": card.get("name"),
+                }
+                for card in hand_select.get("selected_cards") or []
+                if isinstance(card, dict)
+            ],
+            "cards": [
+                {
+                    "index": card.get("index"),
+                    "name": card.get("name"),
+                }
+                for card in hand_select.get("cards") or []
+                if isinstance(card, dict)
+            ],
+        }
+    elif state_type == "crystal_sphere":
+        crystal = state.get("crystal_sphere") or {}
+        digest["crystal_sphere"] = {
+            "grid_width": crystal.get("grid_width"),
+            "grid_height": crystal.get("grid_height"),
+            "tool": crystal.get("tool"),
+            "can_use_big_tool": crystal.get("can_use_big_tool"),
+            "can_use_small_tool": crystal.get("can_use_small_tool"),
+            "divinations_left_text": crystal.get("divinations_left_text"),
+            "can_proceed": crystal.get("can_proceed"),
+            "clickable_cells": crystal.get("clickable_cells") or [],
+            "revealed_items": [
+                {
+                    "item_type": item.get("item_type"),
+                    "x": item.get("x"),
+                    "y": item.get("y"),
+                    "width": item.get("width"),
+                    "height": item.get("height"),
+                    "is_good": item.get("is_good"),
+                }
+                for item in crystal.get("revealed_items") or []
+                if isinstance(item, dict)
             ],
         }
     return digest
@@ -592,6 +924,17 @@ def decision_point(state: dict[str, Any]) -> dict[str, Any]:
         options = (state.get("rest_site") or {}).get("options") or []
         point["kind"] = "rest_choice" if options else "completed_rest"
         point["option_count"] = len(options)
+    elif state_type == "hand_select":
+        hand_select = state.get("hand_select") or {}
+        point["kind"] = "hand_select"
+        point["option_count"] = len(hand_select.get("cards") or [])
+        point["selected_count"] = len(hand_select.get("selected_cards") or [])
+        point["can_confirm"] = hand_select.get("can_confirm")
+    elif state_type == "crystal_sphere":
+        crystal = state.get("crystal_sphere") or {}
+        point["kind"] = "crystal_sphere"
+        point["clickable_count"] = len(crystal.get("clickable_cells") or [])
+        point["can_proceed"] = crystal.get("can_proceed")
     else:
         point["kind"] = state_type or "unknown"
     return point
@@ -622,13 +965,49 @@ def is_transient_state(state: dict[str, Any]) -> bool:
     return False
 
 
+def is_modal_decision_state(state: dict[str, Any]) -> bool:
+    return state.get("state_type") in {"card_select", "bundle_select", "relic_select", "hand_select"}
+
+
+def card_cost_value(card: dict[str, Any]) -> int | None:
+    cost = card.get("cost")
+    if isinstance(cost, (int, float)):
+        return int(cost)
+    text = str(cost or "").strip().casefold()
+    if text in {"0", "x"}:
+        return 0
+    if text.startswith("0"):
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def has_playable_hand_card(state: dict[str, Any]) -> bool:
+    player = state.get("player") or {}
+    energy = player.get("energy")
+    try:
+        energy_value = int(energy)
+    except (TypeError, ValueError):
+        return False
+    for card in hand(state):
+        cost = card_cost_value(card)
+        if cost is None and energy_value > 0:
+            return True
+        if cost is not None and cost <= energy_value:
+            return True
+    return False
+
+
 def is_ready_combat_decision(state: dict[str, Any]) -> bool:
     if not is_combat_state(state):
         return True
     battle = state.get("battle") or {}
     if battle.get("turn") != "player" or battle.get("is_play_phase") is not True:
         return False
-    return bool(hand(state))
+    player = state.get("player") or {}
+    return isinstance(player.get("hand"), list)
 
 
 def next_trivial_action(state: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -687,8 +1066,21 @@ def next_trivial_action(state: dict[str, Any]) -> tuple[dict[str, Any] | None, s
 
     if state_type in {"shop", "fake_merchant"}:
         shop = state.get("shop") or state.get("fake_merchant") or {}
-        if shop.get("can_proceed") and not shop.get("items"):
+        items = [item for item in shop.get("items") or [] if isinstance(item, dict)]
+        affordable_stocked = [
+            item for item in items
+            if item.get("is_stocked") is not False and item.get("can_afford") is True
+        ]
+        if shop.get("can_proceed") and not items:
             return {"action": "proceed"}, f"leave empty {state_type}"
+        if items and not affordable_stocked:
+            return {"action": "proceed"}, f"leave spent {state_type}"
+        return None, None
+
+    if state_type == "crystal_sphere":
+        crystal = state.get("crystal_sphere") or {}
+        if crystal.get("can_proceed") and not crystal.get("clickable_cells"):
+            return {"action": "crystal_sphere_proceed"}, "leave completed crystal sphere"
         return None, None
 
     return None, None
@@ -700,7 +1092,7 @@ def drain_trivial(
     logger: JsonlLogger,
     stats: RunStats,
     max_steps: int = 30,
-    poll_delay: float = 0.12,
+    poll_delay: float = DEFAULT_POLL_DELAY,
     initial_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     drained: list[dict[str, Any]] = []
@@ -712,7 +1104,7 @@ def drain_trivial(
         if body is None:
             if is_transient_state(state) and transient_polls < 20:
                 transient_polls += 1
-                time.sleep(poll_delay)
+                sleep_for_poll(transient_polls - 1, poll_delay)
                 state = client.state()
                 continue
             return state, drained
@@ -731,13 +1123,12 @@ def drain_trivial(
         state_before = deepcopy(state)
         client.post(body)
         drained.append({"reason": reason, "body": body})
-        time.sleep(poll_delay)
         if body.get("action") == "choose_map_node":
             state = wait_for_map_node_transition(
                 client,
                 state_before,
                 logger=logger,
-                max_polls=60,
+                max_polls=DEFAULT_MAX_POLLS,
                 poll_delay=poll_delay,
             )
         else:
@@ -746,7 +1137,7 @@ def drain_trivial(
                 state_before,
                 logger=logger,
                 reason="drain",
-                max_polls=10,
+                max_polls=DEFAULT_MENU_MAX_POLLS,
                 poll_delay=poll_delay,
             )
         logger.write(
@@ -812,13 +1203,116 @@ def find_potion(state: dict[str, Any], slot: int) -> dict[str, Any] | None:
     return None
 
 
+def potion_may_open_modal(state: dict[str, Any], body: dict[str, Any]) -> bool:
+    slot = body.get("slot")
+    if not isinstance(slot, int):
+        return False
+    potion = find_potion(state, slot)
+    if not potion:
+        return False
+    text = " ".join(
+        str(potion.get(key) or "")
+        for key in ("name", "description")
+    ).lower()
+    modal_potion_names = (
+        "skill potion",
+        "attack potion",
+        "power potion",
+        "colorless potion",
+    )
+    return "choose" in text or "select" in text or any(name in text for name in modal_potion_names)
+
+
+MCP_ACTION_ALIASES: dict[str, tuple[str, str | None, dict[str, str]]] = {
+    "use_potion": ("use_potion", None, {"slot": "slot", "target": "target"}),
+    "discard_potion": ("discard_potion", None, {"slot": "slot"}),
+    "proceed_to_map": ("proceed", None, {}),
+    "combat_play_card": ("play_card", None, {"card_index": "card_index", "target": "target"}),
+    "combat_end_turn": ("end_turn", None, {}),
+    "combat_select_card": ("combat_select_card", None, {"card_index": "card_index"}),
+    "combat_confirm_selection": ("combat_confirm_selection", None, {}),
+    "rewards_claim": ("claim_reward", None, {"reward_index": "index"}),
+    "rewards_pick_card": ("select_card_reward", None, {"card_index": "card_index"}),
+    "rewards_skip_card": ("skip_card_reward", None, {}),
+    "map_choose_node": ("choose_map_node", None, {"node_index": "index"}),
+    "rest_choose_option": ("choose_rest_option", None, {"option_index": "index"}),
+    "shop_purchase": ("shop_purchase", None, {"item_index": "index"}),
+    "event_choose_option": ("choose_event_option", None, {"option_index": "index"}),
+    "event_advance_dialogue": ("advance_dialogue", None, {}),
+    "deck_select_card": ("select_card", None, {"card_index": "index"}),
+    "deck_confirm_selection": ("confirm_selection", None, {}),
+    "deck_cancel_selection": ("cancel_selection", None, {}),
+    "bundle_select": ("select_bundle", None, {"bundle_index": "index"}),
+    "bundle_confirm_selection": ("confirm_bundle_selection", None, {}),
+    "bundle_cancel_selection": ("cancel_bundle_selection", None, {}),
+    "relic_select": ("select_relic", None, {"relic_index": "index"}),
+    "relic_skip": ("skip_relic_selection", None, {}),
+    "treasure_claim_relic": ("claim_treasure_relic", None, {"relic_index": "index"}),
+    "crystal_sphere_set_tool": ("crystal_sphere_set_tool", None, {"tool": "tool"}),
+    "crystal_sphere_click_cell": (
+        "crystal_sphere_click_cell",
+        None,
+        {"x": "x", "y": "y"},
+    ),
+    "crystal_sphere_proceed": ("crystal_sphere_proceed", None, {}),
+    "mp_combat_play_card": ("play_card", "multiplayer", {"card_index": "card_index", "target": "target"}),
+    "mp_combat_end_turn": ("end_turn", "multiplayer", {}),
+    "mp_combat_undo_end_turn": ("undo_end_turn", "multiplayer", {}),
+    "mp_use_potion": ("use_potion", "multiplayer", {"slot": "slot", "target": "target"}),
+    "mp_discard_potion": ("discard_potion", "multiplayer", {"slot": "slot"}),
+    "mp_map_vote": ("choose_map_node", "multiplayer", {"node_index": "index"}),
+    "mp_event_choose_option": ("choose_event_option", "multiplayer", {"option_index": "index"}),
+    "mp_event_advance_dialogue": ("advance_dialogue", "multiplayer", {}),
+    "mp_rest_choose_option": ("choose_rest_option", "multiplayer", {"option_index": "index"}),
+    "mp_shop_purchase": ("shop_purchase", "multiplayer", {"item_index": "index"}),
+    "mp_rewards_claim": ("claim_reward", "multiplayer", {"reward_index": "index"}),
+    "mp_rewards_pick_card": ("select_card_reward", "multiplayer", {"card_index": "card_index"}),
+    "mp_rewards_skip_card": ("skip_card_reward", "multiplayer", {}),
+    "mp_proceed_to_map": ("proceed", "multiplayer", {}),
+    "mp_deck_select_card": ("select_card", "multiplayer", {"card_index": "index"}),
+    "mp_deck_confirm_selection": ("confirm_selection", "multiplayer", {}),
+    "mp_deck_cancel_selection": ("cancel_selection", "multiplayer", {}),
+    "mp_bundle_select": ("select_bundle", "multiplayer", {"bundle_index": "index"}),
+    "mp_bundle_confirm_selection": ("confirm_bundle_selection", "multiplayer", {}),
+    "mp_bundle_cancel_selection": ("cancel_bundle_selection", "multiplayer", {}),
+    "mp_combat_select_card": ("combat_select_card", "multiplayer", {"card_index": "card_index"}),
+    "mp_combat_confirm_selection": ("combat_confirm_selection", "multiplayer", {}),
+    "mp_relic_select": ("select_relic", "multiplayer", {"relic_index": "index"}),
+    "mp_relic_skip": ("skip_relic_selection", "multiplayer", {}),
+    "mp_treasure_claim_relic": ("claim_treasure_relic", "multiplayer", {"relic_index": "index"}),
+    "mp_crystal_sphere_set_tool": ("crystal_sphere_set_tool", "multiplayer", {"tool": "tool"}),
+    "mp_crystal_sphere_click_cell": (
+        "crystal_sphere_click_cell",
+        "multiplayer",
+        {"x": "x", "y": "y"},
+    ),
+    "mp_crystal_sphere_proceed": ("crystal_sphere_proceed", "multiplayer", {}),
+}
+
+
+def normalize_mcp_action_alias(planned: dict[str, Any]) -> dict[str, Any]:
+    action = planned.get("action")
+    if not isinstance(action, str) or action not in MCP_ACTION_ALIASES:
+        return planned
+    http_action, endpoint, param_map = MCP_ACTION_ALIASES[action]
+    normalized = {k: v for k, v in planned.items() if k != "action"}
+    normalized["action"] = http_action
+    if endpoint is not None:
+        normalized["_endpoint"] = endpoint
+        normalized.setdefault("_wait", False)
+    for source_key, dest_key in param_map.items():
+        if source_key in planned and dest_key not in normalized:
+            normalized[dest_key] = planned[source_key]
+    return normalized
+
+
 def normalize_action(action: Any) -> dict[str, Any]:
     if isinstance(action, str):
-        return {"action": action}
+        return normalize_mcp_action_alias({"action": action})
     if not isinstance(action, dict):
         raise RuntimeError(f"Action must be a string or object, got {type(action).__name__}")
     if "action" in action:
-        return dict(action)
+        return normalize_mcp_action_alias(dict(action))
     if "play" in action or "card" in action:
         value = action.get("play", action.get("card"))
         normalized = {k: v for k, v in action.items() if k not in {"play", "card"}}
@@ -837,6 +1331,8 @@ def normalize_action(action: Any) -> dict[str, Any]:
         key, value = next(iter(action.items()))
         if key == "drain":
             return {"action": "drain"}
+        if key in {"menu", "menu_select"}:
+            return {"action": "menu_select", "option": value}
         single_index_aliases = {
             "reward",
             "map",
@@ -846,6 +1342,8 @@ def normalize_action(action: Any) -> dict[str, Any]:
             "pick_card",
             "select_card_reward",
             "combat_select_card",
+            "select_hand_card",
+            "hand_select_card",
             "deck_select_card",
             "hand_select",
             "select_card",
@@ -910,6 +1408,7 @@ def action_body_from_plan(
 
     raw_map = {
         "end_turn": ("end_turn", None),
+        "undo_end_turn": ("undo_end_turn", None),
         "choose_map_node": ("choose_map_node", "index"),
         "map": ("choose_map_node", "index"),
         "choose_event_option": ("choose_event_option", "index"),
@@ -924,8 +1423,11 @@ def action_body_from_plan(
         "pick_card": ("select_card_reward", "card_index"),
         "skip_card_reward": ("skip_card_reward", None),
         "combat_select_card": ("combat_select_card", "card_index"),
+        "select_hand_card": ("combat_select_card", "card_index"),
+        "hand_select_card": ("combat_select_card", "card_index"),
         "hand_select": ("combat_select_card", "card_index"),
         "combat_confirm_selection": ("combat_confirm_selection", None),
+        "confirm_hand_selection": ("combat_confirm_selection", None),
         "deck_select_card": ("select_card", "index"),
         "deck_confirm_selection": ("confirm_selection", None),
         "deck_cancel_selection": ("cancel_selection", None),
@@ -945,6 +1447,8 @@ def action_body_from_plan(
         "crystal_sphere_set_tool": ("crystal_sphere_set_tool", "tool"),
         "crystal_sphere_click_cell": ("crystal_sphere_click_cell", None),
         "crystal_sphere_proceed": ("crystal_sphere_proceed", None),
+        "menu_select": ("menu_select", "option"),
+        "menu": ("menu_select", "option"),
     }
     if action == "raw":
         body = planned.get("body")
@@ -967,7 +1471,26 @@ def action_body_from_plan(
         if value is None:
             raise RuntimeError(f"{action} needs '{source_key}'")
         body[param] = value
+    if http_action == "menu_select" and planned.get("seed") is not None:
+        body["seed"] = planned["seed"]
     return body, None
+
+
+def validate_action_allowed_in_state(state: dict[str, Any], body: dict[str, Any]) -> None:
+    combat_only_actions = {
+        "play_card": "play cards",
+        "end_turn": "end the turn",
+        "use_potion": "use potions",
+    }
+    action = body.get("action")
+    if action not in combat_only_actions or is_combat_state(state):
+        return
+    point = decision_point(state)
+    point_kind = point.get("kind") or state.get("state_type") or "unknown"
+    raise RuntimeError(
+        f"Cannot {combat_only_actions[action]} while state_type={state.get('state_type')!r} "
+        f"({point_kind}); resolve the current decision screen first."
+    )
 
 
 def hand_signature(state: dict[str, Any]) -> list[tuple[Any, Any]]:
@@ -978,9 +1501,128 @@ def state_digest_key(state: dict[str, Any]) -> str:
     return json.dumps(state_digest(state), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def log_wait(logger: JsonlLogger, *, started: float, reason: str, polls: int) -> None:
+def adaptive_poll_delay(poll: int, poll_delay: float) -> float:
+    if poll_delay != DEFAULT_POLL_DELAY:
+        return poll_delay
+    if poll < 4:
+        return DEFAULT_INITIAL_POLL_DELAY
+    if poll < 8:
+        return DEFAULT_POLL_DELAY * 0.5
+    return DEFAULT_POLL_DELAY
+
+
+def sleep_for_poll(poll: int, poll_delay: float) -> None:
+    delay = adaptive_poll_delay(poll, poll_delay)
+    if delay > 0:
+        time.sleep(delay)
+
+
+def card_obj_for_body(state: dict[str, Any], body: dict[str, Any]) -> dict[str, Any] | None:
+    card_index = body.get("card_index")
+    for card in hand(state):
+        if card.get("index") == card_index:
+            return card
+    return None
+
+
+def card_play_needs_delayed_settle(state_before: dict[str, Any], body: dict[str, Any]) -> bool:
+    card = card_obj_for_body(state_before, body)
+    if card is None:
+        return False
+    name = str(card.get("name") or "").casefold()
+    description = str(card.get("description") or "").casefold()
+    card_type = str(card.get("type") or "").casefold()
+    delayed_words = (
+        "draw",
+        "put ",
+        "add ",
+        "random",
+        "whenever",
+        "at the end",
+        "play ",
+        "transform",
+        "exhaust your hand",
+    )
+    known_delayed_names = {
+        "battle trance",
+        "brand",
+        "hellraiser",
+        "howl from beyond",
+        "offering",
+        "pommel strike",
+        "shrug it off",
+        "stampede",
+        "thinking ahead",
+        "vicious",
+    }
+    if card_type == "power" or any(fragment in name for fragment in known_delayed_names):
+        return True
+    if any(word in description for word in delayed_words):
+        return True
+    for status in (state_before.get("player") or {}).get("status") or []:
+        if isinstance(status, dict) and str(status.get("id") or status.get("name") or "").casefold() in {
+            "hellraiser_power",
+            "hellraiser",
+            "stampede_power",
+            "stampede",
+            "vicious_power",
+            "vicious",
+        }:
+            return True
+    return False
+
+
+def card_play_may_open_selection(state_before: dict[str, Any], body: dict[str, Any]) -> bool:
+    card = card_obj_for_body(state_before, body)
+    if card is None:
+        return False
+    name = str(card.get("name") or "").casefold()
+    description = str(card.get("description") or "").casefold()
+    if "thinking ahead" in name:
+        return True
+    selection_words = ("choose", "select")
+    selection_phrases = (
+        "put 1 card",
+        "put a card",
+        "from your hand",
+        "on top of your draw",
+        "return a card",
+    )
+    return any(word in description for word in selection_words) or any(
+        phrase in description for phrase in selection_phrases
+    )
+
+
+def card_play_extra_settle_polls(state_before: dict[str, Any], body: dict[str, Any]) -> int:
+    if not card_play_needs_delayed_settle(state_before, body):
+        return 0
+    extra = DELAYED_CARD_SETTLE_POLLS
+    if card_play_may_open_selection(state_before, body):
+        extra += SELECTION_CARD_SETTLE_POLLS
+    return extra
+
+
+def begin_wait(client: Any, logger: JsonlLogger) -> str:
+    wait_id = logger.next_wait_id()
+    try:
+        client.active_wait_id = wait_id
+    except Exception:
+        pass
+    return wait_id
+
+
+def end_wait(client: Any, wait_id: str) -> None:
+    try:
+        if getattr(client, "active_wait_id", None) == wait_id:
+            client.active_wait_id = None
+    except Exception:
+        pass
+
+
+def log_wait(logger: JsonlLogger, *, started: float, reason: str, polls: int, wait_id: str | None = None) -> None:
     logger.write(
         "wait",
+        wait_id=wait_id,
         reason=reason,
         polls=polls,
         elapsed_ms=round((time.perf_counter() - started) * 1000.0, 1),
@@ -992,50 +1634,56 @@ def wait_for_card_play_applied(
     state_before: dict[str, Any],
     *,
     before_sig: list[tuple[Any, Any]],
+    extra_settle_polls: int = 0,
     logger: JsonlLogger,
     max_polls: int,
     poll_delay: float,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
     settling_state: dict[str, Any] | None = None
+    settling_reason: str | None = None
+    stable_polls = 0
     for poll in range(max_polls):
         state = client.state()
+        candidate_reason: str | None = None
+        needed_polls = READY_STATE_SETTLE_POLLS
         if state.get("state_type") != state_before.get("state_type"):
-            log_wait(logger, started=started, reason="card_play_state_changed", polls=poll + 1)
-            return state
-        if not is_combat_state(state):
-            log_wait(logger, started=started, reason="card_play_left_combat", polls=poll + 1)
-            return state
-        if hand_signature(state) != before_sig:
-            if is_transient_state(state) and poll + 1 < max_polls:
-                time.sleep(poll_delay)
-                continue
-            if settling_state is None:
-                if poll + 1 >= max_polls:
-                    log_wait(
-                        logger,
-                        started=started,
-                        reason="card_play_changed_unsettled",
-                        polls=poll + 1,
-                    )
-                    return state
+            if not is_transient_state(state):
+                candidate_reason = "card_play_state_changed"
+        elif not is_combat_state(state):
+            if not is_transient_state(state):
+                candidate_reason = "card_play_left_combat"
+        elif hand_signature(state) != before_sig and not is_transient_state(state):
+            candidate_reason = "card_play_extra_settled" if extra_settle_polls else "card_play_settled"
+            needed_polls = READY_STATE_SETTLE_POLLS + extra_settle_polls
+
+        if candidate_reason is not None:
+            if (
+                settling_state is not None
+                and settling_reason == candidate_reason
+                and state_digest_key(state) == state_digest_key(settling_state)
+            ):
+                stable_polls += 1
+            else:
                 settling_state = state
-                time.sleep(poll_delay)
-                continue
-            if state_digest_key(state) == state_digest_key(settling_state):
-                log_wait(logger, started=started, reason="card_play_settled", polls=poll + 1)
+                settling_reason = candidate_reason
+                stable_polls = 1
+            if stable_polls >= needed_polls:
+                suffix = "_settled" if candidate_reason in {"card_play_state_changed", "card_play_left_combat"} else ""
+                finish(f"{candidate_reason}{suffix}", poll + 1)
                 return state
-            if poll + 1 >= max_polls:
-                log_wait(
-                    logger,
-                    started=started,
-                    reason="card_play_changed_unsettled",
-                    polls=poll + 1,
-                )
-                return state
-            settling_state = state
-        time.sleep(poll_delay)
-    log_wait(logger, started=started, reason="card_play_timeout", polls=max_polls)
+        else:
+            settling_state = None
+            settling_reason = None
+            stable_polls = 0
+        sleep_for_poll(poll, poll_delay)
+    finish("card_play_timeout", max_polls)
     raise RuntimeError(
         f"Timed out waiting for card play to apply after {max_polls} polls"
     )
@@ -1051,16 +1699,55 @@ def wait_for_state_change(
     poll_delay: float,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason_name: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason_name, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
     before_key = state_digest_key(state_before)
     last_state = state_before
+    settling_state: dict[str, Any] | None = None
+    settling_reason: str | None = None
+    stable_polls = 0
     for poll in range(max_polls):
         state = client.state()
         last_state = state
-        if state_digest_key(state) != before_key and not is_transient_state(state):
-            log_wait(logger, started=started, reason=f"{reason}_state_changed", polls=poll + 1)
+        if state_digest_key(state) == before_key or is_transient_state(state):
+            settling_state = None
+            settling_reason = None
+            stable_polls = 0
+            sleep_for_poll(poll, poll_delay)
+            continue
+
+        candidate_reason = f"{reason}_state_changed"
+        needed_polls = READY_STATE_SETTLE_POLLS
+        if is_combat_state(state):
+            if not is_ready_combat_decision(state):
+                settling_state = None
+                settling_reason = None
+                stable_polls = 0
+                sleep_for_poll(poll, poll_delay)
+                continue
+            candidate_reason = f"{reason}_combat_ready"
+            needed_polls = MAP_COMBAT_SETTLE_POLLS
+
+        if (
+            settling_state is not None
+            and settling_reason == candidate_reason
+            and state_digest_key(state) == state_digest_key(settling_state)
+        ):
+            stable_polls += 1
+        else:
+            settling_state = state
+            settling_reason = candidate_reason
+            stable_polls = 1
+        if stable_polls >= needed_polls:
+            suffix = "_settled" if needed_polls > 1 else ""
+            finish(f"{candidate_reason}{suffix}", poll + 1)
             return state
-        time.sleep(poll_delay)
-    log_wait(logger, started=started, reason=f"{reason}_state_unchanged", polls=max_polls)
+        sleep_for_poll(poll, poll_delay)
+    finish(f"{reason}_state_unchanged", max_polls)
     raise RuntimeError(f"Timed out waiting for {reason} state change after {max_polls} polls")
 
 
@@ -1073,19 +1760,50 @@ def wait_for_map_node_transition(
     poll_delay: float,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
     last_state = state_before
+    settling_state: dict[str, Any] | None = None
+    settling_reason: str | None = None
+    stable_polls = 0
     for poll in range(max_polls):
         state = client.state()
         last_state = state
-        if (
-            state.get("state_type") != "map"
-            and not is_transient_state(state)
-            and is_ready_combat_decision(state)
-        ):
-            log_wait(logger, started=started, reason="map_node_state_changed", polls=poll + 1)
-            return state
-        time.sleep(poll_delay)
-    log_wait(logger, started=started, reason="map_node_still_on_map", polls=max_polls)
+        candidate_reason: str | None = None
+        needed_polls = READY_STATE_SETTLE_POLLS
+        if state.get("state_type") != "map" and not is_transient_state(state):
+            if is_combat_state(state):
+                if is_ready_combat_decision(state):
+                    candidate_reason = "map_node_combat_ready"
+                    needed_polls = MAP_COMBAT_SETTLE_POLLS
+            else:
+                candidate_reason = "map_node_state_changed"
+
+        if candidate_reason is not None:
+            if (
+                settling_state is not None
+                and settling_reason == candidate_reason
+                and state_digest_key(state) == state_digest_key(settling_state)
+            ):
+                stable_polls += 1
+            else:
+                settling_state = state
+                settling_reason = candidate_reason
+                stable_polls = 1
+            if stable_polls >= needed_polls:
+                suffix = "_settled" if needed_polls > 1 else ""
+                finish(f"{candidate_reason}{suffix}", poll + 1)
+                return state
+        else:
+            settling_state = None
+            settling_reason = None
+            stable_polls = 0
+        sleep_for_poll(poll, poll_delay)
+    finish("map_node_still_on_map", max_polls)
     state_type = last_state.get("state_type")
     raise RuntimeError(
         f"Timed out waiting for map node transition after {max_polls} polls; "
@@ -1101,16 +1819,22 @@ def wait_for_player_or_screen(
     poll_delay: float,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
     last_state: dict[str, Any] = {}
     for poll in range(max_polls):
         state = client.state()
         last_state = state
         if not is_transient_state(state):
-            log_wait(logger, started=started, reason="ready_state", polls=poll + 1)
+            finish("ready_state", poll + 1)
             return state
-        time.sleep(poll_delay)
+        sleep_for_poll(poll, poll_delay)
     state_type = last_state.get("state_type")
-    log_wait(logger, started=started, reason="ready_state_timeout", polls=max_polls)
+    finish("ready_state_timeout", max_polls)
     raise RuntimeError(
         f"Timed out waiting for a ready state after {max_polls} polls; last state_type={state_type!r}"
     )
@@ -1125,12 +1849,19 @@ def wait_for_end_turn_resolution(
     poll_delay: float,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
     before_key = state_digest_key(state_before)
     before_battle = state_before.get("battle") or {}
     before_round = before_battle.get("round")
     seen_change = False
     ready_state: dict[str, Any] | None = None
     ready_reason: str | None = None
+    ready_stable_polls = 0
     last_state = state_before
     for poll in range(max_polls):
         state = client.state()
@@ -1138,7 +1869,7 @@ def wait_for_end_turn_resolution(
         if state_digest_key(state) != before_key:
             seen_change = True
         if not seen_change:
-            time.sleep(poll_delay)
+            sleep_for_poll(poll, poll_delay)
             continue
         candidate_reason: str | None = None
         if state.get("state_type") != state_before.get("state_type") and not is_transient_state(state):
@@ -1156,27 +1887,107 @@ def wait_for_end_turn_resolution(
             candidate_reason = "end_turn_ready_state"
 
         if candidate_reason is not None:
-            if poll + 1 >= max_polls:
-                log_wait(
-                    logger,
-                    started=started,
-                    reason=f"{candidate_reason}_unsettled",
-                    polls=poll + 1,
-                )
+            needed_polls = (
+                START_TURN_SETTLE_POLLS
+                if candidate_reason == "end_turn_next_player_turn"
+                else READY_STATE_SETTLE_POLLS
+            )
+            if (
+                ready_state is not None
+                and ready_reason == candidate_reason
+                and state_digest_key(state) == state_digest_key(ready_state)
+            ):
+                ready_stable_polls += 1
+            else:
+                ready_state = state
+                ready_reason = candidate_reason
+                ready_stable_polls = 1
+            if ready_stable_polls >= needed_polls:
+                finish(f"{ready_reason}_settled", poll + 1)
                 return state
-            if ready_state is not None and state_digest_key(state) == state_digest_key(ready_state):
-                log_wait(logger, started=started, reason=f"{ready_reason}_settled", polls=poll + 1)
-                return state
-            ready_state = state
-            ready_reason = candidate_reason
         else:
             ready_state = None
             ready_reason = None
-        time.sleep(poll_delay)
+            ready_stable_polls = 0
+        sleep_for_poll(poll, poll_delay)
     state_type = last_state.get("state_type")
-    log_wait(logger, started=started, reason="end_turn_timeout", polls=max_polls)
+    finish("end_turn_timeout", max_polls)
     raise RuntimeError(
         f"Timed out waiting for end turn after {max_polls} polls; last state_type={state_type!r}"
+    )
+
+
+def wait_for_potion_resolution(
+    client: Any,
+    state_before: dict[str, Any],
+    *,
+    action_body: dict[str, Any],
+    logger: JsonlLogger,
+    max_polls: int,
+    poll_delay: float,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
+    before_key = state_digest_key(state_before)
+    may_open_modal = potion_may_open_modal(state_before, action_body)
+    settling_state: dict[str, Any] | None = None
+    settling_reason: str | None = None
+    stable_polls = 0
+    last_state = state_before
+    for poll in range(max_polls):
+        state = client.state()
+        last_state = state
+        if state_digest_key(state) == before_key or is_transient_state(state):
+            settling_state = None
+            settling_reason = None
+            stable_polls = 0
+            sleep_for_poll(poll, poll_delay)
+            continue
+
+        candidate_reason: str | None = None
+        if is_modal_decision_state(state):
+            candidate_reason = "potion_modal_state"
+        elif state.get("state_type") != state_before.get("state_type"):
+            candidate_reason = "potion_state_changed"
+        elif is_combat_state(state):
+            if is_ready_combat_decision(state):
+                candidate_reason = "potion_combat_settled"
+        else:
+            candidate_reason = "potion_ready_state"
+
+        if candidate_reason is None:
+            settling_state = None
+            settling_reason = None
+            stable_polls = 0
+            sleep_for_poll(poll, poll_delay)
+            continue
+
+        if settling_state is not None and state_digest_key(state) == state_digest_key(settling_state):
+            stable_polls += 1
+        else:
+            settling_state = state
+            settling_reason = candidate_reason
+            stable_polls = 1
+
+        needed_polls = 2
+        if settling_reason == "potion_combat_settled":
+            needed_polls += DELAYED_CARD_SETTLE_POLLS
+            if may_open_modal:
+                needed_polls += SELECTION_POTION_SETTLE_POLLS
+        if stable_polls >= needed_polls:
+            finish(f"{settling_reason}_settled", poll + 1)
+            return state
+        sleep_for_poll(poll, poll_delay)
+
+    state_type = last_state.get("state_type")
+    finish("potion_timeout", max_polls)
+    raise RuntimeError(
+        f"Timed out waiting for potion resolution after {max_polls} polls; last state_type={state_type!r}"
     )
 
 
@@ -1192,6 +2003,8 @@ def should_wait_for_state_change_after(body: dict[str, Any]) -> bool:
         "skip_card_reward",
         "combat_select_card",
         "combat_confirm_selection",
+        "select_hand_card",
+        "confirm_hand_selection",
         "select_card",
         "select_bundle",
         "select_relic",
@@ -1203,6 +2016,8 @@ def should_wait_for_state_change_after(body: dict[str, Any]) -> bool:
         "confirm_bundle_selection",
         "cancel_bundle_selection",
         "crystal_sphere_proceed",
+        "menu_select",
+        "undo_end_turn",
     }
 
 
@@ -1234,6 +2049,12 @@ def execute_actions(
             executed.extend({"drain": item} for item in drained)
             continue
 
+        if planned.get("_endpoint") is not None:
+            try:
+                client.endpoint = str(planned["_endpoint"])
+            except Exception:
+                pass
+
         current_state = final_state if final_state else None
         body, state_before = action_body_from_plan(
             client,
@@ -1244,6 +2065,7 @@ def execute_actions(
         if state_before is None:
             state_before = final_state if final_state else client.state()
         state_before = deepcopy(state_before)
+        validate_action_allowed_in_state(state_before, body)
         stats.actions += 1
         logger.write(
             "planned_action",
@@ -1258,14 +2080,24 @@ def execute_actions(
             if body.get("action") == "play_card" and state_before is not None
             else []
         )
+        extra_card_settle_polls = (
+            card_play_extra_settle_polls(state_before, body)
+            if body.get("action") == "play_card"
+            else 0
+        )
         client.post(body)
         executed.append({"planned": planned, "body": body})
 
-        if body.get("action") == "play_card" and state_before is not None:
+        should_wait = planned.get("_wait") is not False
+
+        if not should_wait:
+            final_state = client.state()
+        elif body.get("action") == "play_card" and state_before is not None:
             final_state = wait_for_card_play_applied(
                 client,
                 state_before,
                 before_sig=before_sig,
+                extra_settle_polls=extra_card_settle_polls,
                 logger=logger,
                 max_polls=max_polls,
                 poll_delay=poll_delay,
@@ -1274,6 +2106,15 @@ def execute_actions(
             final_state = wait_for_end_turn_resolution(
                 client,
                 state_before,
+                logger=logger,
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+        elif body.get("action") == "use_potion":
+            final_state = wait_for_potion_resolution(
+                client,
+                state_before,
+                action_body=body,
                 logger=logger,
                 max_polls=max_polls,
                 poll_delay=poll_delay,
@@ -1324,6 +2165,275 @@ def execute_actions(
     return final_state, executed
 
 
+def execute_menu_option(
+    client: Any,
+    option: str,
+    *,
+    logger: JsonlLogger,
+    stats: RunStats,
+    seed: str | None = None,
+    wait: bool = True,
+    require_change: bool = False,
+    max_polls: int,
+    poll_delay: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    state_before = deepcopy(client.state())
+    body: dict[str, Any] = {"action": "menu_select", "option": option}
+    if seed is not None:
+        body["seed"] = seed
+    stats.actions += 1
+    logger.write(
+        "planned_action",
+        planned={"action": "menu_select", "option": option, "seed": seed},
+        body=body,
+        state_type=state_before.get("state_type"),
+        before=state_digest(state_before),
+        decision_point=decision_point(state_before),
+    )
+    post_result = client.post(body)
+    if wait:
+        try:
+            state_after = wait_for_state_change(
+                client,
+                state_before,
+                logger=logger,
+                reason="menu",
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+        except RuntimeError:
+            if require_change:
+                raise
+            state_after = client.state()
+    else:
+        state_after = client.state()
+    logger.write(
+        "action_result",
+        planned={"action": "menu_select", "option": option, "seed": seed},
+        body=body,
+        before=state_digest(state_before),
+        after=state_digest(state_after),
+        delta=state_delta(state_before, state_after),
+        decision_point=decision_point(state_after),
+    )
+    return state_after, {
+        "planned": {"action": "menu_select", "option": option},
+        "body": body,
+        "result": post_result,
+    }
+
+
+def choose_character_option(state: dict[str, Any], requested: str) -> str:
+    wanted = requested.casefold()
+    characters = [
+        character
+        for character in state.get("characters") or []
+        if isinstance(character, dict) and character.get("locked") is not True
+    ]
+    if wanted == "first":
+        if characters:
+            return str(characters[0].get("id") or characters[0].get("name"))
+        names = [
+            name
+            for name in menu_option_names(state)
+            if name not in {"confirm", "embark", "back", "unready"}
+        ]
+        if names:
+            return names[0]
+    for character in characters:
+        values = [
+            str(character.get("id") or ""),
+            str(character.get("name") or ""),
+        ]
+        if any(value.casefold() == wanted for value in values):
+            return str(character.get("id") or character.get("name"))
+    if menu_option_enabled(state, requested):
+        return requested
+    available = ", ".join(
+        str(character.get("id") or character.get("name"))
+        for character in characters
+        if character.get("id") or character.get("name")
+    )
+    if not available:
+        available = ", ".join(menu_option_names(state))
+    raise RuntimeError(f"Character {requested!r} is not available. Available: {available}")
+
+
+def start_run(
+    client: Any,
+    *,
+    logger: JsonlLogger,
+    stats: RunStats,
+    mode: str,
+    character: str,
+    seed: str | None,
+    max_steps: int,
+    max_polls: int,
+    poll_delay: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    executed: list[dict[str, Any]] = []
+    state = client.state()
+    for _ in range(max_steps):
+        state_type = state.get("state_type")
+        if state_type not in {"menu", "game_over"}:
+            if executed:
+                return state, executed
+            raise RuntimeError(
+                f"Cannot start a run while state_type={state_type!r}; "
+                "return to the main menu or game-over screen first."
+            )
+        if state_type == "game_over":
+            state, step = execute_menu_option(
+                client,
+                "main_menu",
+                logger=logger,
+                stats=stats,
+                require_change=True,
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+            executed.append(step)
+            continue
+
+        screen = state.get("menu_screen")
+        if screen == "main":
+            if not menu_option_enabled(state, "singleplayer"):
+                raise RuntimeError(
+                    "Main menu does not expose an enabled singleplayer option; "
+                    f"available options: {menu_option_names(state)}"
+                )
+            state, step = execute_menu_option(
+                client,
+                "singleplayer",
+                logger=logger,
+                stats=stats,
+                require_change=True,
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+            executed.append(step)
+            continue
+
+        if screen == "singleplayer":
+            if not menu_option_enabled(state, mode):
+                raise RuntimeError(
+                    f"Singleplayer mode {mode!r} is not enabled; "
+                    f"available options: {menu_option_names(state)}"
+                )
+            state, step = execute_menu_option(
+                client,
+                mode,
+                logger=logger,
+                stats=stats,
+                require_change=True,
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+            executed.append(step)
+            continue
+
+        if screen == "character_select":
+            if menu_option_enabled(state, "confirm") or menu_option_enabled(state, "embark"):
+                option = "confirm" if menu_option_enabled(state, "confirm") else "embark"
+                state, step = execute_menu_option(
+                    client,
+                    option,
+                    seed=seed,
+                    logger=logger,
+                    stats=stats,
+                    require_change=True,
+                    max_polls=max_polls,
+                    poll_delay=poll_delay,
+                )
+                executed.append(step)
+                continue
+            option = choose_character_option(state, character)
+            state, step = execute_menu_option(
+                client,
+                option,
+                logger=logger,
+                stats=stats,
+                require_change=True,
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+            executed.append(step)
+            continue
+
+        raise RuntimeError(
+            f"Cannot start a run from menu_screen={screen!r}; "
+            f"available options: {menu_option_names(state)}"
+        )
+
+    raise RuntimeError(f"Timed out starting a run after {max_steps} menu steps")
+
+
+def switch_profile(
+    client: STS2Client,
+    profile_id: int,
+    *,
+    logger: JsonlLogger,
+    max_polls: int,
+    poll_delay: float,
+) -> dict[str, Any]:
+    previous_endpoint = client.endpoint
+    client.endpoint = "singleplayer"
+    body = {"action": "switch", "profile_id": profile_id}
+    try:
+        result = client.post_json("/api/v1/profiles", body)
+        message = result.get("message")
+        if isinstance(message, str) and message.startswith("Opened profile screen"):
+            for poll in range(max_polls):
+                sleep_for_poll(poll, poll_delay)
+                state = client.state()
+                if state.get("state_type") == "menu" and state.get("menu_screen") == "profile_select":
+                    result = client.post_json("/api/v1/profiles", body)
+                    break
+        wait_id = begin_wait(client, logger)
+        started = time.perf_counter()
+        last_profiles: dict[str, Any] | None = None
+        try:
+            for poll in range(max_polls):
+                sleep_for_poll(poll, poll_delay)
+                profiles = client.get_json("/api/v1/profiles")
+                last_profiles = profiles if isinstance(profiles, dict) else None
+                if isinstance(profiles, dict) and profiles.get("current_profile_id") == profile_id:
+                    log_wait(
+                        logger,
+                        started=started,
+                        reason="profile_switched",
+                        polls=poll + 1,
+                        wait_id=wait_id,
+                    )
+                    return {
+                        "status": "ok",
+                        "message": f"Switched to profile {profile_id}",
+                        "current_profile_id": profile_id,
+                        "profiles": profiles.get("profiles", []),
+                        "initial_response": result,
+                    }
+            log_wait(
+                logger,
+                started=started,
+                reason="profile_switch_timeout",
+                polls=max_polls,
+                wait_id=wait_id,
+            )
+            return {
+                "status": "error",
+                "error": f"Timed out waiting for profile {profile_id} to become active",
+                "current_profile_id": (
+                    last_profiles.get("current_profile_id") if isinstance(last_profiles, dict) else None
+                ),
+                "profiles": last_profiles.get("profiles", []) if isinstance(last_profiles, dict) else [],
+                "initial_response": result,
+            }
+        finally:
+            end_wait(client, wait_id)
+    finally:
+        client.endpoint = previous_endpoint
+
+
 def load_actions(value: str) -> list[Any]:
     text = Path(value[1:]).read_text(encoding="utf-8") if value.startswith("@") else value
     parsed = json.loads(text)
@@ -1347,6 +2457,7 @@ def emit_result(
     ok: bool,
     stats: RunStats,
     log_path: Path | None,
+    logger: JsonlLogger | None = None,
     state: dict[str, Any] | None = None,
     executed: list[dict[str, Any]] | None = None,
     drained: list[dict[str, Any]] | None = None,
@@ -1369,7 +2480,94 @@ def emit_result(
         result["drained"] = drained
     if state is not None:
         result["state"] = summarize_state(state, verbose=verbose)
-    print(_json_dumps(result, indent=indent))
+    stats.stdout_writes += 1
+    payload = ""
+    for _ in range(4):
+        result["summary"] = {
+            **stats.as_dict(),
+            "log_path": str(log_path) if log_path is not None else None,
+        }
+        payload = _json_dumps(result, indent=indent)
+        stdout_bytes = len(payload.encode("utf-8")) + 1
+        stdout_lines = payload.count("\n") + 1
+        if stats.stdout_bytes == stdout_bytes and stats.stdout_lines == stdout_lines:
+            break
+        stats.stdout_bytes = stdout_bytes
+        stats.stdout_lines = stdout_lines
+    if logger is not None:
+        logger.write(
+            "stdout",
+            bytes=stats.stdout_bytes,
+            lines=stats.stdout_lines,
+            writes=stats.stdout_writes,
+            ok=ok,
+        )
+    print(payload)
+
+
+def emit_data_result(
+    *,
+    ok: bool,
+    stats: RunStats,
+    log_path: Path | None,
+    logger: JsonlLogger | None = None,
+    data: Any | None = None,
+    text: str | None = None,
+    indent: int | None = 2,
+    error: str | None = None,
+) -> None:
+    result: dict[str, Any] = {
+        "ok": ok,
+        "summary": {
+            **stats.as_dict(),
+            "log_path": str(log_path) if log_path is not None else None,
+        },
+    }
+    if error is not None:
+        result["error"] = error
+    if data is not None:
+        result["data"] = data
+    if text is not None:
+        result["text"] = text
+    stats.stdout_writes += 1
+    payload = ""
+    for _ in range(4):
+        result["summary"] = {
+            **stats.as_dict(),
+            "log_path": str(log_path) if log_path is not None else None,
+        }
+        payload = _json_dumps(result, indent=indent)
+        stdout_bytes = len(payload.encode("utf-8")) + 1
+        stdout_lines = payload.count("\n") + 1
+        if stats.stdout_bytes == stdout_bytes and stats.stdout_lines == stdout_lines:
+            break
+        stats.stdout_bytes = stdout_bytes
+        stats.stdout_lines = stdout_lines
+    if logger is not None:
+        logger.write(
+            "stdout",
+            bytes=stats.stdout_bytes,
+            lines=stats.stdout_lines,
+            writes=stats.stdout_writes,
+            ok=ok,
+        )
+    print(payload)
+
+
+def parse_json_text(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def output_log_path(value: str | None) -> Path | None:
+    if value is None:
+        return _default_log_path()
+    path = Path(value)
+    if not path.is_absolute():
+        path = _repo_root() / path
+    return path
 
 
 def resolve_log_path(path: Path) -> Path:
@@ -1449,6 +2647,26 @@ def summarize_command_runs(logs: list[tuple[Path, list[dict[str, Any]]]]) -> dic
         run_end = next((event for event in reversed(ordered_events) if event.get("kind") == "run_end"), {})
         http_events = [event for event in ordered_events if event.get("kind") == "http"]
         post_events = [event for event in http_events if event.get("method") == "POST"]
+        wait_events = [event for event in ordered_events if event.get("kind") == "wait"]
+        stdout_events = [event for event in ordered_events if event.get("kind") == "stdout"]
+        http_total_ms = round(sum(float(event.get("elapsed_ms") or 0) for event in http_events), 1)
+        wait_total_ms = round(sum(float(event.get("elapsed_ms") or 0) for event in wait_events), 1)
+        wait_ids = {event.get("wait_id") for event in wait_events if event.get("wait_id")}
+        wait_http_total_ms = round(
+            sum(
+                float(event.get("elapsed_ms") or 0)
+                for event in http_events
+                if event.get("wait_id") in wait_ids
+            ),
+            1,
+        )
+        wait_non_http_ms = round(max(0.0, wait_total_ms - wait_http_total_ms), 1)
+        active_wall_time_ms = event_span_ms(ordered_events)
+        local_overhead_ms = (
+            round(max(0.0, active_wall_time_ms - http_total_ms - wait_non_http_ms), 1)
+            if active_wall_time_ms is not None
+            else None
+        )
         start_ts = min(timestamps)
         end_ts = max(timestamps)
         first_post_start_ts = http_event_start_ts(post_events[0]) if post_events else None
@@ -1464,12 +2682,27 @@ def summarize_command_runs(logs: list[tuple[Path, list[dict[str, Any]]]]) -> dic
                 "path": str(path),
                 "command": run_start.get("command"),
                 "argv": run_start.get("argv"),
+                "git_sha": run_start.get("git_sha"),
+                "cwd": run_start.get("cwd"),
+                "base_url": run_start.get("base_url"),
+                "timeout": run_start.get("timeout"),
+                "poll_delay": run_start.get("poll_delay"),
+                "max_polls": run_start.get("max_polls"),
                 "start_ts": start_ts.isoformat(timespec="milliseconds"),
                 "end_ts": end_ts.isoformat(timespec="milliseconds"),
-                "active_wall_time_ms": event_span_ms(ordered_events),
+                "active_wall_time_ms": active_wall_time_ms,
+                "http_total_ms": http_total_ms,
+                "wait_elapsed_ms": wait_total_ms,
+                "wait_http_overlap_ms": wait_http_total_ms,
+                "wait_non_http_ms": wait_non_http_ms,
+                "local_overhead_ms": local_overhead_ms,
                 "http_calls": len(http_events),
                 "get_calls": sum(1 for event in http_events if event.get("method") == "GET"),
                 "post_calls": len(post_events),
+                "stdout_bytes": sum(int(event.get("bytes") or 0) for event in stdout_events)
+                or run_end.get("stdout_bytes"),
+                "stdout_lines": sum(int(event.get("lines") or 0) for event in stdout_events)
+                or run_end.get("stdout_lines"),
                 "first_post_action": post_events[0].get("action") if post_events else None,
                 "first_post_started_ts": (
                     first_post_start_ts.isoformat(timespec="milliseconds")
@@ -1560,6 +2793,7 @@ def analyze_events(
 ) -> dict[str, Any]:
     event_kinds = Counter(str(e.get("kind") or "unknown") for e in events)
     http_events = [e for e in events if e.get("kind") == "http"]
+    stdout_events = [e for e in events if e.get("kind") == "stdout"]
     by_action: dict[str, dict[str, Any]] = {}
     for event in http_events:
         action = event.get("action") or f"{event.get('method')} {event.get('path')}"
@@ -1585,11 +2819,20 @@ def analyze_events(
 
     wait_events = [e for e in events if e.get("kind") == "wait"]
     wait_reasons = Counter(str(e.get("reason") or "unknown") for e in wait_events)
+    wait_ids = {e.get("wait_id") for e in wait_events if e.get("wait_id")}
     wait_elapsed_values = [
         float(e.get("elapsed_ms"))
         for e in wait_events
         if isinstance(e.get("elapsed_ms"), (int, float))
     ]
+    wait_http_by_id: dict[str, dict[str, Any]] = {}
+    for event in http_events:
+        wait_id = event.get("wait_id")
+        if not wait_id:
+            continue
+        bucket = wait_http_by_id.setdefault(str(wait_id), {"count": 0, "elapsed_ms": 0.0})
+        bucket["count"] += 1
+        bucket["elapsed_ms"] += float(event.get("elapsed_ms") or 0)
     decision_point_events = Counter()
     before_decision_points = Counter()
     after_decision_points = Counter()
@@ -1639,6 +2882,23 @@ def analyze_events(
                 gameplay["enemy_block_lost"] += int(abs(block_delta))
 
     wall_time_ms = event_span_ms(events)
+    http_total_ms = round(sum(float(e.get("elapsed_ms") or 0) for e in http_events), 1)
+    wait_total_ms = round(sum(wait_elapsed_values), 1)
+    wait_http_overlap_ms = round(
+        sum(
+            float(e.get("elapsed_ms") or 0)
+            for e in http_events
+            if e.get("wait_id") in wait_ids
+        ),
+        1,
+    )
+    wait_non_http_ms = round(max(0.0, wait_total_ms - wait_http_overlap_ms), 1)
+    active_ms = active_wall_time_ms if active_wall_time_ms is not None else wall_time_ms
+    local_overhead_ms = (
+        round(max(0.0, active_ms - http_total_ms - wait_non_http_ms), 1)
+        if active_ms is not None
+        else None
+    )
 
     decision_points = Counter(str(point.get("kind") or "unknown") for point in after_decision_sequence)
 
@@ -1648,15 +2908,36 @@ def analyze_events(
         "events": len(events),
         "event_kinds": dict(sorted(event_kinds.items())),
         "http_calls": len(http_events),
-        "http_total_ms": round(sum(float(e.get("elapsed_ms") or 0) for e in http_events), 1),
+        "http_total_ms": http_total_ms,
         "wall_time_ms": wall_time_ms,
-        "active_wall_time_ms": active_wall_time_ms if active_wall_time_ms is not None else wall_time_ms,
+        "active_wall_time_ms": active_ms,
+        "timing_breakdown": {
+            "active_wall_time_ms": active_ms,
+            "http_total_ms": http_total_ms,
+            "wait_elapsed_ms": wait_total_ms,
+            "wait_http_overlap_ms": wait_http_overlap_ms,
+            "wait_non_http_ms": wait_non_http_ms,
+            "local_overhead_ms": local_overhead_ms,
+            "wait_http_correlation": bool(wait_ids),
+        },
+        "stdout": {
+            "writes": len(stdout_events),
+            "bytes": sum(int(e.get("bytes") or 0) for e in stdout_events),
+            "lines": sum(int(e.get("lines") or 0) for e in stdout_events),
+        },
         "actions": actions,
         "waits": {
             "count": len(wait_events),
             "total_polls": sum(int(e.get("polls") or 0) for e in wait_events),
             "elapsed_ms": _timing_distribution(wait_elapsed_values),
             "reasons": dict(sorted(wait_reasons.items())),
+            "http_by_wait_id": {
+                wait_id: {
+                    "count": data["count"],
+                    "elapsed_ms": round(data["elapsed_ms"], 1),
+                }
+                for wait_id, data in sorted(wait_http_by_id.items())
+            },
         },
         "decision_points": dict(sorted(decision_points.items())),
         "decision_point_events": dict(sorted(decision_point_events.items())),
@@ -1710,10 +2991,21 @@ def expand_log_path_args(values: list[str]) -> list[Path]:
             matches: list[str] = []
             for pattern in patterns:
                 matches.extend(glob.glob(pattern))
-            unique_matches = sorted(dict.fromkeys(matches))
+            seen_matches: set[str] = set()
+            unique_matches: list[str] = []
+            for match in sorted(matches):
+                match_key = str(Path(match).resolve())
+                if match_key in seen_matches:
+                    continue
+                seen_matches.add(match_key)
+                unique_matches.append(match)
+            if not unique_matches:
+                raise RuntimeError(f"Log pattern matched no files: {value}")
             paths.extend(Path(match) for match in unique_matches)
         else:
             paths.append(Path(value))
+    if not paths:
+        raise RuntimeError("No log paths provided")
     return paths
 
 
@@ -1728,12 +3020,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log", default=None, help="JSONL log path. Defaults to logs/sts2-fast/<timestamp>.jsonl")
     parser.add_argument("--no-log", action="store_true")
     parser.add_argument("--compact", action="store_true", help="Print compact JSON")
+    parser.add_argument("--multiplayer", action="store_true", help="Use /api/v1/multiplayer for run state/actions")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     state = sub.add_parser("state", help="Print a concise game-state summary")
     state.add_argument("--drain", action="store_true", help="Auto-resolve trivial screens before printing")
     state.add_argument("--verbose", action="store_true")
+    state.add_argument("--raw-format", choices=["json", "markdown"], default=None, help="Return the raw API state in the requested MCP-compatible format")
+
+    sub.add_parser("map", help="Print the full current act map graph")
 
     drain = sub.add_parser("drain", help="Auto-resolve no-decision screens")
     drain.add_argument("--max-steps", type=int, default=30)
@@ -1744,8 +3040,8 @@ def build_parser() -> argparse.ArgumentParser:
     act.add_argument("--no-auto-target", action="store_true")
     act.add_argument("--drain", action="store_true", help="Run trivial drain after each action")
     act.add_argument("--no-wait-end-turn", action="store_true")
-    act.add_argument("--max-polls", type=int, default=60)
-    act.add_argument("--poll-delay", type=float, default=0.12)
+    act.add_argument("--max-polls", type=int, default=DEFAULT_MAX_POLLS)
+    act.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
     act.add_argument("--verbose", action="store_true")
 
     cards = sub.add_parser("cards", help="Play a sequence of cards by name in one CLI call")
@@ -1753,12 +3049,47 @@ def build_parser() -> argparse.ArgumentParser:
     cards.add_argument("--target", default=None, help="first, lowest_hp, highest_hp, entity id, or omitted for auto")
     cards.add_argument("--end-turn", action="store_true")
     cards.add_argument("--drain", action="store_true")
-    cards.add_argument("--max-polls", type=int, default=60)
-    cards.add_argument("--poll-delay", type=float, default=0.12)
+    cards.add_argument("--max-polls", type=int, default=DEFAULT_MAX_POLLS)
+    cards.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
     cards.add_argument("--verbose", action="store_true")
 
     analyze = sub.add_parser("analyze-log", help="Summarize sts2-fast JSONL timing logs")
     analyze.add_argument("paths", nargs="+")
+
+    menu = sub.add_parser("menu", help="Select a visible menu/game-over option")
+    menu.add_argument("option")
+    menu.add_argument("--seed", default=None)
+    menu.add_argument("--no-wait", action="store_true", help="Return after the POST instead of waiting for visible state to change")
+    menu.add_argument("--max-polls", type=int, default=DEFAULT_MENU_MAX_POLLS)
+    menu.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
+    menu.add_argument("--verbose", action="store_true")
+
+    start_run_parser = sub.add_parser("start-run", help="Start a standard singleplayer run from the menu")
+    start_run_parser.add_argument("--mode", default="standard", choices=["standard", "daily", "custom"])
+    start_run_parser.add_argument("--character", default="ironclad", help="Character id/name, or 'first'")
+    start_run_parser.add_argument("--seed", default=None)
+    start_run_parser.add_argument("--max-steps", type=int, default=8)
+    start_run_parser.add_argument("--max-polls", type=int, default=DEFAULT_START_RUN_MAX_POLLS)
+    start_run_parser.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
+    start_run_parser.add_argument("--verbose", action="store_true")
+
+    sub.add_parser("profile", help="Get active profile progress")
+    sub.add_parser("compendium", help="Get active profile compendium")
+    profiles = sub.add_parser("profiles", help="List profile slots")
+    profiles.add_argument("--delete", type=int, default=None, help="Delete an inactive profile slot")
+
+    switch_profile_parser = sub.add_parser("switch-profile", help="Switch profile slot through the game UI")
+    switch_profile_parser.add_argument("profile_id", type=int)
+    switch_profile_parser.add_argument("--max-polls", type=int, default=30)
+    switch_profile_parser.add_argument("--poll-delay", type=float, default=DEFAULT_PROFILE_POLL_DELAY)
+
+    delete_profile_parser = sub.add_parser("delete-profile", help="Delete an inactive profile slot")
+    delete_profile_parser.add_argument("profile_id", type=int)
+
+    wiki = sub.add_parser("wiki", help="Search profile-unlocked wiki entries")
+    wiki.add_argument("query")
+    wiki.add_argument("--item-type", default="all", choices=["all", "card", "relic"])
+    wiki.add_argument("--limit", type=int, default=10)
 
     return parser
 
@@ -1766,11 +3097,40 @@ def build_parser() -> argparse.ArgumentParser:
 def make_client(args: argparse.Namespace, logger: JsonlLogger, stats: RunStats) -> STS2Client:
     return STS2Client(
         base_url=args.base_url,
+        endpoint="multiplayer" if args.multiplayer else "singleplayer",
         logger=logger,
         stats=stats,
         timeout=args.timeout,
         trust_env=args.trust_env,
     )
+
+
+def run_start_metadata(args: argparse.Namespace, argv: list[str] | None, log_path: Path | None) -> dict[str, Any]:
+    return {
+        "command": args.command,
+        "argv": sys.argv[1:] if argv is None else argv,
+        "pid": os.getpid(),
+        "cwd": str(Path.cwd()),
+        "repo_root": str(_repo_root()),
+        "git_sha": _git_head_sha(),
+        "python": {
+            "version": platform.python_version(),
+            "implementation": platform.python_implementation(),
+            "executable": sys.executable,
+        },
+        "platform": platform.platform(),
+        "base_url": args.base_url,
+        "endpoint": "multiplayer" if args.multiplayer else "singleplayer",
+        "timeout": args.timeout,
+        "trust_env": args.trust_env,
+        "log_path": str(log_path) if log_path is not None else None,
+        "compact": bool(args.compact),
+        "poll_delay": getattr(args, "poll_delay", None),
+        "max_polls": getattr(args, "max_polls", None),
+        "max_steps": getattr(args, "max_steps", None),
+        "drain": bool(getattr(args, "drain", False)),
+        "no_log": bool(args.no_log),
+    }
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -1779,17 +3139,43 @@ def run(argv: list[str] | None = None) -> int:
     indent = None if args.compact else 2
 
     if args.command == "analyze-log":
-        print(_json_dumps(analyze_logs(expand_log_path_args(args.paths)), indent=indent))
-        return 0
+        try:
+            print(_json_dumps(analyze_logs(expand_log_path_args(args.paths)), indent=indent))
+            return 0
+        except Exception as exc:
+            print(_json_dumps({"ok": False, "error": str(exc)}, indent=indent))
+            return 1
 
-    log_path = None if args.no_log else Path(args.log) if args.log else _default_log_path()
+    log_path = None if args.no_log else output_log_path(args.log)
     logger = JsonlLogger(log_path)
     stats = RunStats()
-    logger.write("run_start", command=args.command, argv=sys.argv[1:] if argv is None else argv)
+    logger.write("run_start", **run_start_metadata(args, argv, log_path))
 
     client = make_client(args, logger, stats)
     try:
         if args.command == "state":
+            if args.raw_format is not None:
+                if args.drain:
+                    drain_trivial(client, logger=logger, stats=stats)
+                text = client.state_text(format_name=args.raw_format)
+                data = parse_json_text(text) if args.raw_format == "json" else None
+                logger.write(
+                    "data_result",
+                    endpoint=client.endpoint,
+                    path=client.run_path(),
+                    raw_format=args.raw_format,
+                    bytes=len(text.encode("utf-8")),
+                )
+                emit_data_result(
+                    ok=True,
+                    stats=stats,
+                    log_path=log_path,
+                    logger=logger,
+                    data=data,
+                    text=None if data is not None else text,
+                    indent=indent,
+                )
+                return 0
             if args.drain:
                 state, drained = drain_trivial(client, logger=logger, stats=stats)
             else:
@@ -1799,9 +3185,201 @@ def run(argv: list[str] | None = None) -> int:
                 ok=True,
                 stats=stats,
                 log_path=log_path,
+                logger=logger,
                 state=state,
                 drained=drained,
                 verbose=args.verbose,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "map":
+            state = client.state()
+            data = act_map_data(state)
+            logger.write(
+                "data_result",
+                endpoint=client.endpoint,
+                path=client.run_path(),
+                data_kind="act_map",
+                node_count=len(data.get("nodes") or []),
+                next_option_count=len(data.get("next_options") or []),
+                decision_point=decision_point(state),
+            )
+            emit_data_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "menu":
+            state, executed = execute_menu_option(
+                client,
+                args.option,
+                seed=args.seed,
+                wait=not args.no_wait,
+                logger=logger,
+                stats=stats,
+                max_polls=args.max_polls,
+                poll_delay=args.poll_delay,
+            )
+            log_state_result(logger, state)
+            emit_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                state=state,
+                executed=[executed],
+                verbose=args.verbose,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "start-run":
+            state, executed = start_run(
+                client,
+                logger=logger,
+                stats=stats,
+                mode=args.mode,
+                character=args.character,
+                seed=args.seed,
+                max_steps=args.max_steps,
+                max_polls=args.max_polls,
+                poll_delay=args.poll_delay,
+            )
+            log_state_result(logger, state)
+            emit_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                state=state,
+                executed=executed,
+                verbose=args.verbose,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "profile":
+            data = client.get_json("/api/v1/profile")
+            logger.write("data_result", path="/api/v1/profile", data=data)
+            emit_data_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "compendium":
+            data = client.get_json("/api/v1/compendium")
+            logger.write("data_result", path="/api/v1/compendium", data=data)
+            emit_data_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "wiki":
+            data = client.get_json(
+                "/api/v1/wiki",
+                params={
+                    "query": args.query,
+                    "item_type": args.item_type,
+                    "limit": args.limit,
+                },
+            )
+            logger.write(
+                "data_result",
+                path="/api/v1/wiki",
+                query=args.query,
+                item_type=args.item_type,
+                limit=args.limit,
+                data=data,
+            )
+            emit_data_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "profiles":
+            if args.delete is not None:
+                data = client.post_json(
+                    "/api/v1/profiles",
+                    {"action": "delete", "profile_id": args.delete},
+                )
+                logger.write("data_result", path="/api/v1/profiles", action="delete", data=data)
+            else:
+                data = client.get_json("/api/v1/profiles")
+                logger.write("data_result", path="/api/v1/profiles", data=data)
+            emit_data_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
+                indent=indent,
+            )
+            return 0
+
+        if args.command == "switch-profile":
+            data = switch_profile(
+                client,
+                args.profile_id,
+                logger=logger,
+                max_polls=args.max_polls,
+                poll_delay=args.poll_delay,
+            )
+            logger.write(
+                "data_result",
+                path="/api/v1/profiles",
+                action="switch",
+                profile_id=args.profile_id,
+                data=data,
+            )
+            emit_data_result(
+                ok=data.get("status") != "error",
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
+                indent=indent,
+            )
+            return 0 if data.get("status") != "error" else 1
+
+        if args.command == "delete-profile":
+            data = client.post_json(
+                "/api/v1/profiles",
+                {"action": "delete", "profile_id": args.profile_id},
+            )
+            logger.write(
+                "data_result",
+                path="/api/v1/profiles",
+                action="delete",
+                profile_id=args.profile_id,
+                data=data,
+            )
+            emit_data_result(
+                ok=True,
+                stats=stats,
+                log_path=log_path,
+                logger=logger,
+                data=data,
                 indent=indent,
             )
             return 0
@@ -1818,6 +3396,7 @@ def run(argv: list[str] | None = None) -> int:
                 ok=True,
                 stats=stats,
                 log_path=log_path,
+                logger=logger,
                 state=state,
                 drained=drained,
                 verbose=args.verbose,
@@ -1843,6 +3422,7 @@ def run(argv: list[str] | None = None) -> int:
                 ok=True,
                 stats=stats,
                 log_path=log_path,
+                logger=logger,
                 state=state,
                 executed=executed,
                 verbose=args.verbose,
@@ -1873,6 +3453,7 @@ def run(argv: list[str] | None = None) -> int:
                 ok=True,
                 stats=stats,
                 log_path=log_path,
+                logger=logger,
                 state=state,
                 executed=executed,
                 verbose=args.verbose,
@@ -1888,6 +3469,7 @@ def run(argv: list[str] | None = None) -> int:
             ok=False,
             stats=stats,
             log_path=log_path,
+            logger=logger,
             error=str(exc),
             indent=indent,
         )

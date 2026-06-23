@@ -69,3 +69,37 @@ Good automation candidates:
 
 Keep these lessons in repo-local skills so the next run starts smarter without
 needing to rediscover basic control rules.
+
+## Timing Metrics To Inspect
+
+After a measured fight or act slice, run `analyze-log` and inspect:
+
+- `command_timing.next_post_gaps.first_post`: agent-side delay until the next
+  game-changing POST. This is an observed wall-clock gap between CLI commands;
+  it includes model reasoning, tool dispatch, shell/runtime overhead, user
+  interruption, and any non-POST commands between POSTs. Treat it as
+  end-to-end agent loop delay, not pure Codex internal think time.
+- `timing_breakdown.http_total_ms`: local API/request time.
+- `timing_breakdown.wait_elapsed_ms`: total animation/poll wait span time.
+- `timing_breakdown.wait_http_overlap_ms`: HTTP time spent inside wait spans.
+- `timing_breakdown.wait_non_http_ms`: sleep/animation time after removing
+  correlated wait HTTP.
+- `timing_breakdown.local_overhead_ms`: CLI/runtime overhead outside HTTP and
+  non-HTTP waits.
+- `stdout.bytes` and per-run `stdout_bytes`: model-visible CLI output size.
+
+If `wait_http_correlation` is false, the log predates wait IDs and the wait
+breakdown is less precise. New logs correlate polling GETs to specific wait
+spans through `wait_id`.
+
+## Documentation Loop
+
+When a run teaches a new control-surface lesson, update the durable docs in the
+same slice:
+
+- `cli-surface.md` for commands, flags, action aliases, wait behavior, drain
+  rules, log fields, MCP parity, and extension steps.
+- `SKILL.md` for the short gameplay workflow and which references to load.
+- `README.md` for player-facing setup and common command examples.
+- `notes/api-interaction-quality.md` for empirical findings, measurements, and
+  caveats from live play.
