@@ -102,10 +102,14 @@ The CLI is intended to cover the original MCP bridge without requiring an MCP
 server:
 
 - `state`: concise current run state; use `--drain`, `--verbose`, or
-  `--raw-format json|markdown` for MCP-compatible state output.
+  `--raw-format json|markdown` for MCP-compatible state output. Compact combat
+  state includes a `combat.tactical` checksum for incoming damage, enemy attack
+  totals, player statuses, and hard constraints such as Bound.
 - `map`: full current act map graph for route planning while on a map screen.
 - `start-run`: walk main menu -> singleplayer mode -> character select ->
-  embark for a fresh singleplayer run.
+  embark for a fresh singleplayer run. If post-game Timeline epochs require
+  manual reveal before singleplayer returns, the CLI reports the pending ids
+  instead of trying to bypass the manual game ceremony.
 - `menu`: select visible menu, lobby, Timeline, tutorial/popup, profile, or
   game-over options through the old `menu_select` action.
 - `act`: execute a JSON action plan. It accepts ergonomic shorthands like

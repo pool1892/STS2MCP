@@ -135,6 +135,11 @@ uv run --directory cli python sts2_fast_cli.py --multiplayer --compact state --r
   debugging parity or missing fields.
 - `state --drain --raw-format json|markdown` drains first, then fetches raw
   state text.
+- Compact combat summaries include `combat.tactical` with total incoming attack
+  damage, per-enemy attack totals, compact player status names, and deterministic
+  constraints such as `incoming>block`, `player_constraint:Chains of Binding`,
+  `bound_cards`, and unknown attack-damage markers. Use this as a low-token
+  tactical checksum, not as a replacement for raw state when a turn is close.
 
 ## Whole Act Map
 
@@ -193,6 +198,10 @@ uv run --directory cli python sts2_fast_cli.py --compact menu confirm --no-wait
   an abandon-run tool.
 - `start-run` can begin from main menu or game-over. It walks through
   singleplayer, mode select, character select, and confirm/embark.
+- If the post-game main menu hides singleplayer because Timeline epochs require
+  manual reveal, `start-run` exits with an actionable error that includes the
+  pending epoch ids. The mod intentionally blocks automation from opening that
+  Timeline state; clear the reveal in game, then run `start-run` again.
 
 ## Gameplay Actions
 

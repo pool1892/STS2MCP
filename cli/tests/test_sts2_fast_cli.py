@@ -1218,6 +1218,51 @@ class FakeMenuStartRunClient:
         return {"status": "ok"}
 
 
+class FakeBlockedTimelineStartRunClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._state = {
+            "state_type": "menu",
+            "menu_screen": "main",
+            "player": {"potions": []},
+            "options": ["settings", "quit"],
+            "blocked_options": [
+                {
+                    "name": "timeline",
+                    "reason": "manual_epoch_reveal_required",
+                    "pending_epoch_ids": ["epoch_a", "epoch_b"],
+                }
+            ],
+        }
+
+    def state(self):
+        self.state_calls += 1
+        return self._state
+
+    def post(self, body):
+        self.posts.append(body)
+        return {"status": "error", "manual_action_required": True}
+
+
+class FakeGameOverToBlockedTimelineStartRunClient(FakeBlockedTimelineStartRunClient):
+    def __init__(self):
+        super().__init__()
+        self._blocked_state = self._state
+        self._state = {
+            "state_type": "game_over",
+            "player": {"potions": []},
+            "run": {"act": 3, "floor": 48},
+        }
+
+    def post(self, body):
+        self.posts.append(body)
+        if body == {"action": "menu_select", "option": "main_menu"}:
+            self._state = self._blocked_state
+            return {"status": "ok"}
+        return {"status": "error", "manual_action_required": True}
+
+
 class FakeNoChangeMenuClient:
     def __init__(self):
         self.posts = []
@@ -2459,6 +2504,187 @@ class FastCliTests(unittest.TestCase):
         self.assertEqual(point["option_count"], 2)
         self.assertFalse(point["can_confirm"])
 
+    def test_combat_summary_includes_low_token_tactical_block(self):
+        state = {
+            "state_type": "boss",
+            "player": {
+                "hp": 41,
+                "max_hp": 80,
+                "block": 7,
+                "energy": 3,
+                "potions": [],
+                "status": [
+                    {"id": "WEAK", "name": "Weak", "amount": 2, "type": "Debuff"},
+                    {
+                        "id": "CHAINS_OF_BINDING",
+                        "name": "Chains of Binding",
+                        "amount": 1,
+                        "description": "Only one Bound card can be played.",
+                    },
+                ],
+                "hand": [
+                    {
+                        "index": 0,
+                        "name": "Bound Strike",
+                        "cost": "1",
+                        "description": "Bound. Deal 6 damage.",
+                        "keywords": [
+                            {
+                                "name": "Bound",
+                                "description": "Only one Bound card can be played.",
+                            }
+                        ],
+                    },
+                    {"index": 1, "name": "Defend", "cost": "1", "description": "Gain 5 Block."},
+                ],
+            },
+            "battle": {
+                "round": 4,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [
+                    {
+                        "entity_id": "QUEEN_0",
+                        "name": "Queen",
+                        "hp": 180,
+                        "intents": [
+                            {
+                                "type": "Attack",
+                                "label": "6",
+                                "title": "Attack",
+                                "description": "Deals 6 damage 2 times.",
+                            },
+                            {
+                                "type": "Debuff",
+                                "title": "Debuff",
+                                "description": "Applies Frail.",
+                            },
+                        ],
+                    },
+                    {
+                        "entity_id": "MINION_0",
+                        "name": "Minion",
+                        "hp": 30,
+                        "intents": [
+                            {
+                                "type": "Attack",
+                                "label": "5",
+                                "title": "Attack",
+                                "description": "Deals 5 damage.",
+                            }
+                        ],
+                    },
+                    {
+                        "entity_id": "SENTRY_0",
+                        "name": "Sentry",
+                        "hp": 20,
+                        "intents": [{"type": "Sleep", "title": "Sleep"}],
+                    },
+                ],
+            },
+        }
+
+        tactical = summarize_state(state)["combat"]["tactical"]
+
+        self.assertEqual(tactical["incoming_damage"], 17)
+        self.assertEqual(
+            tactical["enemy_attack_damage"],
+            [
+                {"id": "QUEEN_0", "name": "Queen", "damage": 12},
+                {"id": "MINION_0", "name": "Minion", "damage": 5},
+                {"id": "SENTRY_0", "name": "Sentry", "damage": 0},
+            ],
+        )
+        self.assertEqual(tactical["player_status"], ["Weak 2", "Chains of Binding 1"])
+        self.assertEqual(
+            tactical["constraints"],
+            [
+                "incoming>block:17>7",
+                "player_constraint:Chains of Binding 1",
+                "bound_cards:0:Bound Strike",
+            ],
+        )
+
+    def test_combat_tactical_summary_handles_damage_variants_and_unknowns(self):
+        state = {
+            "state_type": "monster",
+            "player": {
+                "hp": 30,
+                "block": 0,
+                "energy": 3,
+                "potions": [],
+                "status": [],
+                "hand": [],
+            },
+            "battle": {
+                "round": 2,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [
+                    {
+                        "entity_id": "MULTI_0",
+                        "name": "Multi",
+                        "intents": [{"type": "Attack", "label": "6×3", "title": "Attack"}],
+                    },
+                    {
+                        "entity_id": "TEXT_0",
+                        "name": "Text",
+                        "intents": [
+                            {
+                                "type": "Intent",
+                                "title": "Aggressive",
+                                "description": "This enemy intends to Attack for 14 damage.",
+                            }
+                        ],
+                    },
+                    {
+                        "entity_id": "MYSTERY_0",
+                        "name": "Mystery",
+                        "intents": [{"type": "Attack", "label": "?", "title": "Attack"}],
+                    },
+                    {
+                        "entity_id": "BUFF_0",
+                        "name": "Buff",
+                        "intents": [
+                            {
+                                "type": "Buff",
+                                "title": "Barrier",
+                                "description": "This enemy intends to prevent damage.",
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+
+        tactical = summarize_state(state)["combat"]["tactical"]
+
+        self.assertEqual(tactical["incoming_damage"], 32)
+        self.assertEqual(
+            tactical["enemy_attack_damage"],
+            [
+                {"id": "MULTI_0", "name": "Multi", "damage": 18},
+                {"id": "TEXT_0", "name": "Text", "damage": 14},
+                {"id": "MYSTERY_0", "name": "Mystery", "damage": 0},
+                {"id": "BUFF_0", "name": "Buff", "damage": 0},
+            ],
+        )
+        self.assertEqual(
+            tactical["constraints"],
+            ["incoming>block:32>0", "unknown_attack_damage:MYSTERY_0"],
+        )
+
+    def test_non_combat_summary_does_not_add_tactical_block(self):
+        summary = summarize_state(
+            {
+                "state_type": "map",
+                "player": {"potions": []},
+                "map": {"next_options": []},
+            }
+        )
+
+        self.assertNotIn("combat", summary)
+
     def test_hand_selection_alias_uses_current_mod_compatible_http_action(self):
         body, _ = action_body_from_plan(
             FakeDelayedHandSelectClient(),
@@ -2545,6 +2771,48 @@ class FastCliTests(unittest.TestCase):
             ["singleplayer", "standard", "ironclad", "confirm"],
         )
         self.assertEqual(stats.actions, 4)
+
+    def test_start_run_explains_manual_timeline_reveal_blocker(self):
+        fake = FakeBlockedTimelineStartRunClient()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "manual Timeline reveal.*pending_epoch_ids=.*epoch_a.*epoch_b",
+        ):
+            start_run(
+                fake,
+                logger=quiet_logger(),
+                stats=RunStats(),
+                mode="standard",
+                character="ironclad",
+                seed=None,
+                max_steps=8,
+                max_polls=3,
+                poll_delay=0,
+            )
+
+        self.assertEqual(fake.posts, [])
+
+    def test_start_run_explains_timeline_blocker_after_game_over_return(self):
+        fake = FakeGameOverToBlockedTimelineStartRunClient()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "manual Timeline reveal.*pending_epoch_ids=.*epoch_a.*epoch_b",
+        ):
+            start_run(
+                fake,
+                logger=quiet_logger(),
+                stats=RunStats(),
+                mode="standard",
+                character="ironclad",
+                seed=None,
+                max_steps=8,
+                max_polls=3,
+                poll_delay=0,
+            )
+
+        self.assertEqual(fake.posts, [{"action": "menu_select", "option": "main_menu"}])
 
     def test_start_run_refuses_active_run_state(self):
         with self.assertRaisesRegex(RuntimeError, "Cannot start a run"):

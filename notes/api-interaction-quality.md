@@ -104,3 +104,16 @@ Purpose: prototype observations about whether the localhost API and fast CLI exp
 - The CLI's fail-closed behavior prevented compounding one bad draw assumption:
   a batch that expected Defends stopped when `Defend` was absent, preserving
   the actual mid-turn state for recovery.
+
+## 2026-06-22 Fresh-Run Blocker After Game Over
+
+- After the Act 3 game over, the main menu exposed only `settings` and `quit`;
+  `singleplayer` was absent because `blocked_options` contained `timeline` with
+  reason `manual_epoch_reveal_required` and pending epoch ids.
+- Live canaries confirmed this is an intentional API boundary, not a polling
+  issue: `menu timeline` returned `manual_action_required`, and `menu advance`
+  returned `Unknown menu option`.
+- The CLI should surface this as a manual Timeline reveal requirement before
+  promising that `start-run` can begin from game over. This is exactly the kind
+  of boundary where the agent must ask for the real manual action instead of
+  inventing a fake start path.

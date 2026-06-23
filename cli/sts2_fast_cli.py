@@ -12,6 +12,7 @@ import glob
 import json
 import os
 import platform
+import re
 import sys
 import time
 from collections import Counter
@@ -321,6 +322,190 @@ def hand(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [c for c in player.get("hand") or [] if isinstance(c, dict)]
 
 
+_DAMAGE_MULTIPLIER_RE = re.compile(r"\b(\d+)\s*(?:x|\*)\s*(\d+)\b", re.IGNORECASE)
+_DAMAGE_TIMES_RE = re.compile(
+    r"\bdeals?\s+(\d+)\s+damage\s+(\d+)\s+times\b",
+    re.IGNORECASE,
+)
+_TIMES_FOR_DAMAGE_RE = re.compile(
+    r"\b(\d+)\s+times\s+for\s+(\d+)\s+damage\b",
+    re.IGNORECASE,
+)
+_FOR_DAMAGE_RE = re.compile(r"\bfor\s+(\d+)\s+damage\b", re.IGNORECASE)
+_DAMAGE_RE = re.compile(r"\bdeals?\s+(\d+)\s+damage\b", re.IGNORECASE)
+_PLAIN_INT_RE = re.compile(r"^\s*(\d+)\s*$")
+_BOUND_CONSTRAINT_RE = re.compile(r"\b(bound|chains of binding)\b", re.IGNORECASE)
+
+
+def _parse_damage_text(value: Any, *, allow_plain_number: bool) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value >= 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\u00d7", "x")
+    if allow_plain_number:
+        match = _PLAIN_INT_RE.match(text)
+        if match:
+            return int(match.group(1))
+
+    match = _DAMAGE_MULTIPLIER_RE.search(text)
+    if match:
+        return int(match.group(1)) * int(match.group(2))
+
+    match = _DAMAGE_TIMES_RE.search(text)
+    if match:
+        return int(match.group(1)) * int(match.group(2))
+
+    match = _TIMES_FOR_DAMAGE_RE.search(text)
+    if match:
+        return int(match.group(1)) * int(match.group(2))
+
+    match = _FOR_DAMAGE_RE.search(text)
+    if match:
+        return int(match.group(1))
+
+    match = _DAMAGE_RE.search(text)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def _is_attack_intent(intent: dict[str, Any]) -> bool:
+    intent_type = str(intent.get("type") or "").casefold()
+    title = str(intent.get("title") or "").casefold()
+    return (
+        "attack" in intent_type
+        or "attack" in title
+        or _parse_damage_text(intent.get("description"), allow_plain_number=False) is not None
+    )
+
+
+def _intent_attack_damage(intent: dict[str, Any]) -> int | None:
+    for key, allow_plain_number in [
+        ("label", False),
+        ("description", False),
+        ("title", False),
+        ("label", True),
+    ]:
+        damage = _parse_damage_text(intent.get(key), allow_plain_number=allow_plain_number)
+        if damage is not None:
+            return damage
+    return None
+
+
+def _compact_status_name(status: dict[str, Any]) -> str | None:
+    name = status.get("name") or status.get("id")
+    if not name:
+        return None
+    amount = status.get("amount")
+    if amount is None or amount == -1:
+        return str(name)
+    return f"{name} {amount}"
+
+
+def _compact_status_names(statuses: list[Any]) -> list[str]:
+    names: list[str] = []
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        name = _compact_status_name(status)
+        if name:
+            names.append(name)
+    return names
+
+
+def _constraint_text_values(item: dict[str, Any]) -> list[str]:
+    values = [
+        str(item[key])
+        for key in ["id", "name", "description", "unplayable_reason"]
+        if item.get(key)
+    ]
+    for keyword in item.get("keywords") or []:
+        if isinstance(keyword, dict):
+            values.extend(
+                str(keyword[key])
+                for key in ["id", "name", "description"]
+                if keyword.get(key)
+            )
+        elif keyword:
+            values.append(str(keyword))
+    return values
+
+
+def _has_bound_constraint(item: dict[str, Any]) -> bool:
+    return any(_BOUND_CONSTRAINT_RE.search(value) for value in _constraint_text_values(item))
+
+
+def combat_tactical_summary(state: dict[str, Any]) -> dict[str, Any]:
+    player = state.get("player") or {}
+    incoming_damage = 0
+    unknown_attack_damage: list[str] = []
+    enemy_attack_damage: list[dict[str, Any]] = []
+
+    for enemy in enemies(state):
+        enemy_damage = 0
+        has_unknown_attack = False
+        for intent in enemy.get("intents") or []:
+            if not isinstance(intent, dict) or not _is_attack_intent(intent):
+                continue
+            damage = _intent_attack_damage(intent)
+            if damage is None:
+                has_unknown_attack = True
+            else:
+                enemy_damage += damage
+        enemy_id = enemy.get("entity_id")
+        enemy_attack_damage.append(
+            {
+                "id": enemy_id,
+                "name": enemy.get("name"),
+                "damage": enemy_damage,
+            }
+        )
+        incoming_damage += enemy_damage
+        if has_unknown_attack and enemy_id:
+            unknown_attack_damage.append(str(enemy_id))
+
+    player_statuses = [
+        status
+        for status in player.get("status") or []
+        if isinstance(status, dict)
+    ]
+    player_status = _compact_status_names(player_statuses)
+    constraints: list[str] = []
+
+    block = player.get("block")
+    if isinstance(block, (int, float)) and incoming_damage > block:
+        constraints.append(f"incoming>block:{incoming_damage}>{int(block)}")
+    elif incoming_damage == 0 and not unknown_attack_damage:
+        constraints.append("no_incoming_attack")
+
+    for status in player_statuses:
+        if _has_bound_constraint(status):
+            status_name = _compact_status_name(status) or "status"
+            constraints.append(f"player_constraint:{status_name}")
+
+    bound_cards = [
+        f"{card.get('index')}:{card.get('name')}"
+        for card in hand(state)
+        if _has_bound_constraint(card)
+    ]
+    if bound_cards:
+        constraints.append(f"bound_cards:{','.join(bound_cards)}")
+
+    if unknown_attack_damage:
+        constraints.append(f"unknown_attack_damage:{','.join(unknown_attack_damage)}")
+
+    return {
+        "incoming_damage": incoming_damage,
+        "enemy_attack_damage": enemy_attack_damage,
+        "player_status": player_status,
+        "constraints": constraints,
+    }
+
+
 def summarize_state(state: dict[str, Any], *, verbose: bool = False) -> dict[str, Any]:
     player = state.get("player") or {}
     summary: dict[str, Any] = {
@@ -380,6 +565,7 @@ def summarize_state(state: dict[str, Any], *, verbose: bool = False) -> dict[str
             "round": battle.get("round"),
             "turn": battle.get("turn"),
             "is_play_phase": battle.get("is_play_phase"),
+            "tactical": combat_tactical_summary(state),
             "hand": [
                 {
                     "index": c.get("index"),
@@ -577,6 +763,23 @@ def menu_option_names(state: dict[str, Any], *, enabled_only: bool = True) -> li
 def menu_option_enabled(state: dict[str, Any], option_name: str) -> bool:
     wanted = option_name.casefold()
     return any(name.casefold() == wanted for name in menu_option_names(state, enabled_only=True))
+
+
+def manual_timeline_reveal_pending_epoch_ids(state: dict[str, Any]) -> list[str] | None:
+    for option in state.get("blocked_options") or []:
+        if not isinstance(option, dict):
+            continue
+        name = option.get("name") or option.get("title") or option.get("option")
+        reason = option.get("reason")
+        if str(name or "").casefold() != "timeline":
+            continue
+        if reason != "manual_epoch_reveal_required":
+            continue
+        pending_ids = option.get("pending_epoch_ids") or []
+        if not isinstance(pending_ids, list):
+            pending_ids = [pending_ids]
+        return [str(epoch_id) for epoch_id in pending_ids if epoch_id is not None]
+    return None
 
 
 def state_digest(state: dict[str, Any]) -> dict[str, Any]:
@@ -2521,6 +2724,13 @@ def start_run(
         screen = state.get("menu_screen")
         if screen == "main":
             if not menu_option_enabled(state, "singleplayer"):
+                pending_epoch_ids = manual_timeline_reveal_pending_epoch_ids(state)
+                if pending_epoch_ids is not None:
+                    raise RuntimeError(
+                        "Cannot start a run because Timeline has epochs that require "
+                        "manual Timeline reveal in game before singleplayer is available; "
+                        f"pending_epoch_ids={pending_epoch_ids}"
+                    )
                 raise RuntimeError(
                     "Main menu does not expose an enabled singleplayer option; "
                     f"available options: {menu_option_names(state)}"
