@@ -15,6 +15,10 @@ Decision posture:
 
 - Win the current run before optimizing style points.
 - Spend HP only when it buys tempo, relic value, or survival later.
+- Before every card choice, inspect the whole current deck context. This
+  includes card rewards, shops, upgrades, removals, transforms, enchantments,
+  event card choices, generated-card choices, and tactical card-selection
+  prompts. Do not ignore deck fit under any circumstances.
 - Prefer cards that solve current deck gaps or strengthen an observed engine.
 - Treat no-decision screens as control flow, not strategy.
 - Preserve lessons in run notes when a choice teaches something reusable.

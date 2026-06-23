@@ -15,6 +15,7 @@ from sts2_fast_cli import (
     DEFAULT_MENU_MAX_POLLS,
     DEFAULT_POLL_DELAY,
     DEFAULT_START_RUN_MAX_POLLS,
+    FAST_CARD_SETTLE_POLLS,
     JsonlLogger,
     MAP_COMBAT_SETTLE_POLLS,
     SELECTION_CARD_SETTLE_POLLS,
@@ -31,6 +32,7 @@ from sts2_fast_cli import (
     emit_result,
     execute_menu_option,
     execute_actions,
+    expand_action_macros,
     expand_log_path_args,
     normalize_action,
     output_log_path,
@@ -850,6 +852,12 @@ class FakeDelayedCardSelectClient:
         if body["action"] == "select_card":
             self._stale_reads = 1
             self._state = self._card_select(can_confirm=True)
+        elif body["action"] == "confirm_selection":
+            self._state = {
+                "state_type": "map",
+                "player": {"potions": []},
+                "map": {"next_options": [{"index": 0, "type": "Monster"}]},
+            }
         return {}
 
 
@@ -974,6 +982,167 @@ class FakeConfirmHandSelectionDelayedRewardClient:
         self.posts.append(body)
         if body["action"] == "combat_confirm_selection":
             self._states = [self._combat_state()] * 6 + [self._rewards_state()] * 3
+        return {}
+
+
+class FakeHandPickConfirmClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._current = {
+            "state_type": "hand_select",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "hand": [
+                    {"index": 0, "name": "Defend"},
+                    {"index": 1, "name": "Bash"},
+                ],
+            },
+            "battle": {
+                "round": 1,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "CULTIST_0", "name": "Cultist", "hp": 20}],
+            },
+            "hand_select": {
+                "mode": "simple_select",
+                "prompt": "Choose a card to put on top of your Draw Pile.",
+                "selected_cards": [],
+                "cards": [
+                    {"index": 0, "name": "Defend"},
+                    {"index": 1, "name": "Bash"},
+                ],
+                "can_confirm": False,
+            },
+        }
+
+    def _selected_state(self):
+        state = deepcopy(self._current)
+        state["hand_select"]["selected_cards"] = [{"index": 1, "name": "Bash"}]
+        state["hand_select"]["cards"] = [{"index": 0, "name": "Defend"}]
+        state["hand_select"]["can_confirm"] = True
+        return state
+
+    def _combat_state(self):
+        return {
+            "state_type": "monster",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "hand": [{"index": 0, "name": "Strike", "cost": "1"}],
+            },
+            "battle": {
+                "round": 1,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "CULTIST_0", "name": "Cultist", "hp": 20}],
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        return self._current
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "combat_select_card":
+            self._current = self._selected_state()
+        elif body["action"] == "combat_confirm_selection":
+            self._current = self._combat_state()
+        return {}
+
+
+class FakeSimpleStableCardPlayClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._current = {
+            "state_type": "monster",
+            "player": {
+                "hp": 50,
+                "block": 0,
+                "energy": 3,
+                "hand": [
+                    {"index": 0, "name": "Strike", "cost": "1", "description": "Deal 6 damage."},
+                ],
+            },
+            "battle": {
+                "round": 1,
+                "turn": "player",
+                "is_play_phase": True,
+                "enemies": [{"entity_id": "CULTIST_0", "name": "Cultist", "hp": 20}],
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        return self._current
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "play_card":
+            self._current = {
+                "state_type": "monster",
+                "player": {
+                    "hp": 50,
+                    "block": 0,
+                    "energy": 2,
+                    "hand": [],
+                },
+                "battle": {
+                    "round": 1,
+                    "turn": "player",
+                    "is_play_phase": True,
+                    "enemies": [{"entity_id": "CULTIST_0", "name": "Cultist", "hp": 14}],
+                },
+            }
+        return {}
+
+
+class FakeBundlePickClient:
+    def __init__(self):
+        self.posts = []
+        self.state_calls = 0
+        self._state = self._bundle_select(can_confirm=False)
+        self._stale_reads = 0
+
+    def _bundle_select(self, *, can_confirm):
+        return {
+            "state_type": "bundle_select",
+            "player": {"potions": []},
+            "bundle_select": {
+                "prompt": "Choose a bundle.",
+                "can_confirm": can_confirm,
+                "can_cancel": True,
+                "selected_bundle": {"index": 0, "name": "Bundle A"} if can_confirm else None,
+                "bundles": [
+                    {"index": 0, "name": "Bundle A"},
+                    {"index": 1, "name": "Bundle B"},
+                ],
+            },
+        }
+
+    def state(self):
+        self.state_calls += 1
+        if self._stale_reads > 0:
+            self._stale_reads -= 1
+            return self._bundle_select(can_confirm=False)
+        return self._state
+
+    def post(self, body):
+        self.posts.append(body)
+        if body["action"] == "select_bundle":
+            self._stale_reads = 1
+            self._state = self._bundle_select(can_confirm=True)
+        elif body["action"] == "confirm_bundle_selection":
+            self._state = {
+                "state_type": "map",
+                "player": {"potions": []},
+                "map": {"next_options": [{"index": 0, "type": "Monster"}]},
+            }
         return {}
 
 
@@ -1107,6 +1276,229 @@ class FastCliTests(unittest.TestCase):
 
         self.assertEqual(body, {"action": "claim_reward", "index": 0})
         self.assertEqual(reason, "claim gold")
+
+    def test_expand_action_macros_supports_pick_and_confirm_shorthands(self):
+        self.assertEqual(
+            expand_action_macros([{"hand_pick": 1}, {"deck_pick": 4}, {"bundle_pick": 0}]),
+            [
+                {
+                    "action": "combat_select_card",
+                    "card_index": 1,
+                    "_macro": "hand_pick",
+                    "_macro_select_state": "hand_select",
+                },
+                {
+                    "action": "combat_confirm_selection",
+                    "_macro": "hand_pick",
+                    "_macro_confirm_state": "hand_select",
+                },
+                {
+                    "action": "select_card",
+                    "index": 4,
+                    "_macro": "deck_pick",
+                    "_macro_select_state": "card_select",
+                },
+                {
+                    "action": "confirm_selection",
+                    "_macro": "deck_pick",
+                    "_macro_confirm_state": "card_select",
+                },
+                {
+                    "action": "select_bundle",
+                    "index": 0,
+                    "_macro": "bundle_pick",
+                    "_macro_select_state": "bundle_select",
+                },
+                {
+                    "action": "confirm_bundle_selection",
+                    "_macro": "bundle_pick",
+                    "_macro_confirm_state": "bundle_select",
+                },
+            ],
+        )
+
+    def test_hand_pick_macro_selects_and_confirms_in_one_action_plan(self):
+        fake = FakeHandPickConfirmClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"hand_pick": 1}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=20,
+            poll_delay=0,
+        )
+
+        self.assertEqual(state["state_type"], "monster")
+        self.assertEqual(
+            [post["action"] for post in fake.posts],
+            ["combat_select_card", "combat_confirm_selection"],
+        )
+        self.assertEqual(
+            [item["planned"].get("_macro") for item in executed],
+            ["hand_pick", "hand_pick"],
+        )
+
+    def test_hand_pick_macro_skips_confirm_when_selection_resolves_modal(self):
+        fake = FakeDelayedHandSelectClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"hand_pick": 1}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=20,
+            poll_delay=0,
+        )
+
+        self.assertEqual(state["state_type"], "monster")
+        self.assertEqual([post["action"] for post in fake.posts], ["combat_select_card"])
+        self.assertTrue(executed[-1]["skipped"])
+
+    def test_deck_pick_macro_waits_for_confirmable_card_select(self):
+        fake = FakeDelayedCardSelectClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"deck_pick": 1}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=20,
+            poll_delay=0,
+        )
+
+        self.assertEqual(state["state_type"], "map")
+        self.assertEqual([post["action"] for post in fake.posts], ["select_card", "confirm_selection"])
+        self.assertEqual(
+            [item["planned"].get("_macro") for item in executed],
+            ["deck_pick", "deck_pick"],
+        )
+
+    def test_bundle_pick_macro_waits_for_confirmable_bundle_select(self):
+        fake = FakeBundlePickClient()
+        stats = RunStats()
+
+        state, executed = execute_actions(
+            fake,
+            [{"bundle_pick": 0}],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=20,
+            poll_delay=0,
+        )
+
+        self.assertEqual(state["state_type"], "map")
+        self.assertEqual(
+            [post["action"] for post in fake.posts],
+            ["select_bundle", "confirm_bundle_selection"],
+        )
+        self.assertEqual(
+            [item["planned"].get("_macro") for item in executed],
+            ["bundle_pick", "bundle_pick"],
+        )
+
+    def test_parser_exposes_fast_action_waits_for_act_and_cards(self):
+        parser = build_parser()
+
+        act_args = parser.parse_args(
+            ["--compact", "act", "[{\"play\":\"Strike\"}]", "--fast-action-waits"]
+        )
+        cards_args = parser.parse_args(["cards", "Strike", "--fast-action-waits"])
+
+        self.assertTrue(act_args.fast_action_waits)
+        self.assertTrue(cards_args.fast_action_waits)
+
+    def test_fast_action_waits_reduce_simple_card_settle_poll_count(self):
+        fake_default = FakeSimpleStableCardPlayClient()
+        default_stats = RunStats()
+        execute_actions(
+            fake_default,
+            [{"play": "Strike", "target": "first"}],
+            logger=quiet_logger(),
+            stats=default_stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=10,
+            poll_delay=0,
+        )
+
+        fake_fast = FakeSimpleStableCardPlayClient()
+        fast_stats = RunStats()
+        execute_actions(
+            fake_fast,
+            [{"play": "Strike", "target": "first"}],
+            logger=quiet_logger(),
+            stats=fast_stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=10,
+            poll_delay=0,
+            fast_action_waits=True,
+        )
+
+        self.assertEqual(FAST_CARD_SETTLE_POLLS, 1)
+        self.assertLess(fake_fast.state_calls, fake_default.state_calls)
+        self.assertEqual(fake_fast.posts, fake_default.posts)
+
+    def test_fast_action_waits_keep_intermediate_card_actions_conservative(self):
+        fake = FakeClient(
+            {
+                "state_type": "monster",
+                "player": {
+                    "hp": 50,
+                    "block": 0,
+                    "energy": 3,
+                    "potions": [],
+                    "hand": [
+                        {"index": 0, "name": "Strike", "cost": "1", "description": "Deal 6 damage."},
+                        {"index": 1, "name": "Strike", "cost": "1", "description": "Deal 6 damage."},
+                    ],
+                },
+                "battle": {
+                    "round": 1,
+                    "turn": "player",
+                    "is_play_phase": True,
+                    "enemies": [{"entity_id": "CULTIST_0", "name": "Cultist", "hp": 20}],
+                },
+            }
+        )
+        stats = RunStats()
+
+        execute_actions(
+            fake,
+            [
+                {"play": "Strike", "target": "first"},
+                {"play": "Strike", "target": "first"},
+            ],
+            logger=quiet_logger(),
+            stats=stats,
+            auto_target=True,
+            drain_after=False,
+            wait_after_end_turn=True,
+            max_polls=10,
+            poll_delay=0,
+            fast_action_waits=True,
+        )
+
+        self.assertEqual(fake.state_calls, 4)
+        self.assertEqual([post["card_index"] for post in fake.posts], [0, 0])
 
     def test_next_trivial_action_chooses_only_map_node(self):
         state = {

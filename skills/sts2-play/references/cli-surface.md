@@ -67,8 +67,8 @@ Global flags must come before the subcommand.
 | `state` | Read the current game state. | `--drain`, `--verbose`, `--raw-format json|markdown` |
 | `map` | Read the full current act map graph. | none |
 | `drain` | Resolve no-decision screens only. | `--max-steps N`, `--verbose` |
-| `act ACTIONS` | Execute one JSON object/list, or `@path/to/actions.json`. | `--no-auto-target`, `--drain`, `--no-wait-end-turn`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
-| `cards CARD...` | Play card names in order with index re-resolution between plays. | `--target POLICY`, `--end-turn`, `--drain`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
+| `act ACTIONS` | Execute one JSON object/list, or `@path/to/actions.json`. | `--no-auto-target`, `--drain`, `--no-wait-end-turn`, `--fast-action-waits`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
+| `cards CARD...` | Play card names in order with index re-resolution between plays. | `--target POLICY`, `--end-turn`, `--drain`, `--fast-action-waits`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
 | `analyze-log PATH...` | Summarize one or more JSONL timing logs. | Paths may be files or glob patterns. Empty globs fail loudly. |
 | `menu OPTION` | Select a visible menu/lobby/game-over/popup/profile option. | `--seed SEED`, `--no-wait`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
 | `start-run` | Start a fresh singleplayer run from menu or game over. | `--mode standard|daily|custom`, `--character CHARACTER|first`, `--seed SEED`, `--max-steps N`, `--max-polls N`, `--poll-delay SECONDS`, `--verbose` |
@@ -232,6 +232,10 @@ Common action shorthands:
 {"event":0}
 {"rest":1}
 {"shop":3}
+{"hand_pick":1}
+{"deck_pick":4}
+{"card_select_pick":4}
+{"bundle_pick":0}
 {"deck_select_card":4}
 {"action":"deck_confirm_selection"}
 {"action":"deck_cancel_selection"}
@@ -258,6 +262,20 @@ Action plans may use either ergonomic shorthands or exact HTTP action names.
 between card plays so shifted hand indexes do not corrupt the later actions.
 No-argument actions that do not have an ergonomic shorthand should use the
 explicit `{"action":"..."}` shape.
+
+Pick-and-confirm macros reduce one-decision modal screens to one planned
+action:
+
+- `{"hand_pick":1}` selects a `hand_select` card and confirms only if the modal
+  is still present and `can_confirm` is true.
+- `{"deck_pick":4}` and `{"card_select_pick":4}` select a card-selection item
+  and confirm when `card_select.can_confirm` becomes true.
+- `{"bundle_pick":0}` selects a bundle and confirms when
+  `bundle_select.can_confirm` becomes true.
+
+Use these when the selected item is the whole decision. Use lower-level select
+and confirm actions when multiple selections, cancellation, or post-select
+inspection is strategically relevant.
 
 Action input formats:
 
@@ -292,6 +310,13 @@ Batching rules:
 - `act --drain` and `cards --drain` run no-decision draining after each action.
 - `--no-auto-target` disables automatic enemy targeting for cards and potions
   whose current state requires a target.
+- `--fast-action-waits` shortens settle checks for the final simple in-combat
+  card play in an action plan. Intermediate card plays stay conservative so
+  subsequent name/index resolution does not read a stale hand. Delayed,
+  draw/modal-opening cards, potions, map transitions, end turns, and
+  screen-changing waits remain conservative.
+- Use `--fast-action-waits` only when the command's final card play does not
+  need a conservative post-action state for an immediate follow-up decision.
 - `--no-wait-end-turn` returns after posting `end_turn`; use only for low-level
   debugging because normal play needs the next ready state.
 
@@ -328,6 +353,10 @@ Waiting behavior:
   receive extra stability polls before the CLI returns. Cards likely to open a
   hand/card selection prompt receive additional settle budget so combat-looking
   intermediate frames do not hide the modal.
+- With `--fast-action-waits`, the final simple in-combat card play uses a
+  shorter settle window. Treat this as an optimization for deterministic,
+  already-reasoned endings, not as the default for uncertain draw, target,
+  lethal, or follow-up-card lines.
 - `end_turn` waits for the next player turn or next ready screen unless
   `--no-wait-end-turn` is set. A player-turn combat state is considered ready
   after a short stable run, not merely because one poll showed a playable card.
@@ -398,6 +427,10 @@ Default wait reasons appear in timing logs, including:
 - `map_node_state_changed_settled`
 - `action_combat_ready_settled`
 - `action_state_changed_settled`
+- `hand_select_can_confirm_settled`
+- `hand_select_resolved_settled`
+- `card_select_can_confirm_settled`
+- `bundle_select_can_confirm_settled`
 - `menu_state_changed_settled`
 - `drain_state_changed_settled`
 - `ready_state`

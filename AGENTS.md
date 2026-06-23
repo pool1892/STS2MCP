@@ -36,6 +36,15 @@ corresponding gameplay skill/reference docs in the same slice. If subagents are
 unavailable, make the same CLI and skill updates directly before continuing
 long-form play.
 
+## High-Level Gameplay Invariants
+
+- **Always inspect the whole deck before card choices.** This applies to card
+  rewards, shops, upgrades, removals, transforms, enchantments, event card
+  choices, generated-card choices, and tactical card-selection prompts. Deck fit
+  is non-negotiable: judge every card against the current full deck, relics,
+  powers, piles, and active engine, not against isolated card text or generic
+  tier strength.
+
 ## CLI State Tips
 
 ### State Polling
@@ -77,9 +86,14 @@ long-form play.
 
 ### Core Principles
 1. **HP is a resource, not a score.** Take calculated damage to deal more. Don't waste energy on block when enemies aren't attacking.
-2. **Deck quality > deck size.** Skip card rewards if nothing synergizes. A lean deck draws key cards more often.
-3. **Front-load damage.** Killing enemies faster means less total damage taken.
-4. **Read intents carefully.** Sleep/Buff = go all-out offense. Attack = balance block and damage. Debuff = usually no damage, offense turn.
+2. **Whole deck before card choices.** Before choosing, buying, skipping,
+   upgrading, removing, enchanting, or otherwise evaluating a card, inspect the
+   whole current deck context first: draw pile, discard pile, exhaust pile,
+   hand, retained/generated cards, relics, powers, and the deck's active
+   engine. Do not judge a card only by local text or generic tier strength.
+3. **Deck quality > deck size.** Skip card rewards if nothing synergizes. A lean deck draws key cards more often.
+4. **Front-load damage.** Killing enemies faster means less total damage taken.
+5. **Read intents carefully.** Sleep/Buff = go all-out offense. Attack = balance block and damage. Debuff = usually no damage, offense turn.
 
 ### Combat Sequencing (General)
 1. Play 0-cost utility/setup cards first.
@@ -96,7 +110,7 @@ long-form play.
 - **Rest before Boss** — heal if below 80% HP. Boss fights are long and punishing.
 - **Unknown nodes** are safer than Elites. Good at medium HP.
 - **Shops** — visit with 100+ gold.
-- **Deck quality matters more than quantity** — don't add cards just because they're offered.
+- **Deck fit must be verified from the whole deck** — don't add cards just because they're offered or because they look good in isolation.
 
 ### Boss Fights
 - **Kill the leader, not the minions.** Enemies with "Minion" power flee when their leader dies.

@@ -33,6 +33,7 @@ DEFAULT_MENU_MAX_POLLS = 120
 DEFAULT_START_RUN_MAX_POLLS = 160
 DEFAULT_PROFILE_POLL_DELAY = 0.08
 READY_STATE_SETTLE_POLLS = 2
+FAST_CARD_SETTLE_POLLS = 1
 DELAYED_CARD_SETTLE_POLLS = 8
 SELECTION_CARD_SETTLE_POLLS = 6
 START_TURN_SETTLE_POLLS = 8
@@ -764,6 +765,37 @@ def state_digest(state: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(card, dict)
             ],
         }
+    elif state_type == "bundle_select":
+        bundle_select = state.get("bundle_select") or {}
+        digest["bundle_select"] = {
+            "prompt": bundle_select.get("prompt"),
+            "can_confirm": bundle_select.get("can_confirm"),
+            "can_cancel": bundle_select.get("can_cancel"),
+            "selected_bundle": bundle_select.get("selected_bundle"),
+            "bundles": [
+                {
+                    "index": bundle.get("index"),
+                    "name": bundle.get("name"),
+                    "title": bundle.get("title"),
+                }
+                for bundle in bundle_select.get("bundles") or []
+                if isinstance(bundle, dict)
+            ],
+        }
+    elif state_type == "relic_select":
+        relic_select = state.get("relic_select") or {}
+        digest["relic_select"] = {
+            "prompt": relic_select.get("prompt"),
+            "can_cancel": relic_select.get("can_cancel"),
+            "relics": [
+                {
+                    "index": relic.get("index"),
+                    "name": relic.get("name"),
+                }
+                for relic in relic_select.get("relics") or []
+                if isinstance(relic, dict)
+            ],
+        }
     elif state_type == "crystal_sphere":
         crystal = state.get("crystal_sphere") or {}
         digest["crystal_sphere"] = {
@@ -1339,6 +1371,10 @@ def normalize_action(action: Any) -> dict[str, Any]:
             "event",
             "rest",
             "shop",
+            "deck_pick",
+            "card_select_pick",
+            "hand_pick",
+            "bundle_pick",
             "pick_card",
             "select_card_reward",
             "combat_select_card",
@@ -1355,6 +1391,75 @@ def normalize_action(action: Any) -> dict[str, Any]:
         if key in single_index_aliases:
             return {"action": key, "index": value}
     raise RuntimeError(f"Action object needs an 'action' field: {action}")
+
+
+def expand_action_macros(actions: list[Any]) -> list[dict[str, Any]]:
+    expanded: list[dict[str, Any]] = []
+    for raw_action in actions:
+        planned = normalize_action(raw_action)
+        action = planned.get("action")
+        if action in {"deck_pick", "card_select_pick"}:
+            index = planned.get("index")
+            if index is None:
+                raise RuntimeError(f"{action} needs 'index'")
+            expanded.append(
+                {
+                    "action": "select_card",
+                    "index": index,
+                    "_macro": action,
+                    "_macro_select_state": "card_select",
+                }
+            )
+            expanded.append(
+                {
+                    "action": "confirm_selection",
+                    "_macro": action,
+                    "_macro_confirm_state": "card_select",
+                }
+            )
+            continue
+        if action == "hand_pick":
+            index = planned.get("index")
+            if index is None:
+                raise RuntimeError("hand_pick needs 'index'")
+            expanded.append(
+                {
+                    "action": "combat_select_card",
+                    "card_index": index,
+                    "_macro": action,
+                    "_macro_select_state": "hand_select",
+                }
+            )
+            expanded.append(
+                {
+                    "action": "combat_confirm_selection",
+                    "_macro": action,
+                    "_macro_confirm_state": "hand_select",
+                }
+            )
+            continue
+        if action == "bundle_pick":
+            index = planned.get("index")
+            if index is None:
+                raise RuntimeError("bundle_pick needs 'index'")
+            expanded.append(
+                {
+                    "action": "select_bundle",
+                    "index": index,
+                    "_macro": action,
+                    "_macro_select_state": "bundle_select",
+                }
+            )
+            expanded.append(
+                {
+                    "action": "confirm_bundle_selection",
+                    "_macro": action,
+                    "_macro_confirm_state": "bundle_select",
+                }
+            )
+            continue
+        expanded.append(planned)
+    return expanded
 
 
 def action_body_from_plan(
@@ -1634,6 +1739,7 @@ def wait_for_card_play_applied(
     state_before: dict[str, Any],
     *,
     before_sig: list[tuple[Any, Any]],
+    base_settle_polls: int = READY_STATE_SETTLE_POLLS,
     extra_settle_polls: int = 0,
     logger: JsonlLogger,
     max_polls: int,
@@ -1661,7 +1767,7 @@ def wait_for_card_play_applied(
                 candidate_reason = "card_play_left_combat"
         elif hand_signature(state) != before_sig and not is_transient_state(state):
             candidate_reason = "card_play_extra_settled" if extra_settle_polls else "card_play_settled"
-            needed_polls = READY_STATE_SETTLE_POLLS + extra_settle_polls
+            needed_polls = base_settle_polls + extra_settle_polls
 
         if candidate_reason is not None:
             if (
@@ -1749,6 +1855,84 @@ def wait_for_state_change(
         sleep_for_poll(poll, poll_delay)
     finish(f"{reason}_state_unchanged", max_polls)
     raise RuntimeError(f"Timed out waiting for {reason} state change after {max_polls} polls")
+
+
+def modal_can_confirm(state: dict[str, Any], expected_state_type: str) -> bool:
+    modal = state.get(expected_state_type)
+    return isinstance(modal, dict) and modal.get("can_confirm") is True
+
+
+def wait_for_modal_selection_result(
+    client: Any,
+    state_before: dict[str, Any],
+    *,
+    expected_state_type: str,
+    logger: JsonlLogger,
+    max_polls: int,
+    poll_delay: float,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    wait_id = begin_wait(client, logger)
+
+    def finish(reason: str, polls: int) -> None:
+        log_wait(logger, started=started, reason=reason, polls=polls, wait_id=wait_id)
+        end_wait(client, wait_id)
+
+    before_key = state_digest_key(state_before)
+    settling_state: dict[str, Any] | None = None
+    settling_reason: str | None = None
+    stable_polls = 0
+    last_state = state_before
+    for poll in range(max_polls):
+        state = client.state()
+        last_state = state
+        if state_digest_key(state) == before_key or is_transient_state(state):
+            settling_state = None
+            settling_reason = None
+            stable_polls = 0
+            sleep_for_poll(poll, poll_delay)
+            continue
+
+        candidate_reason: str | None = None
+        needed_polls = READY_STATE_SETTLE_POLLS
+        if state.get("state_type") == expected_state_type:
+            if modal_can_confirm(state, expected_state_type):
+                candidate_reason = f"{expected_state_type}_can_confirm"
+        else:
+            candidate_reason = f"{expected_state_type}_resolved"
+            if is_combat_state(state):
+                if not is_ready_combat_decision(state):
+                    candidate_reason = None
+                else:
+                    needed_polls = MAP_COMBAT_SETTLE_POLLS
+
+        if candidate_reason is not None:
+            if (
+                settling_state is not None
+                and settling_reason == candidate_reason
+                and state_digest_key(state) == state_digest_key(settling_state)
+            ):
+                stable_polls += 1
+            else:
+                settling_state = state
+                settling_reason = candidate_reason
+                stable_polls = 1
+            if stable_polls >= needed_polls:
+                suffix = "_settled" if needed_polls > 1 else ""
+                finish(f"{candidate_reason}{suffix}", poll + 1)
+                return state
+        else:
+            settling_state = None
+            settling_reason = None
+            stable_polls = 0
+        sleep_for_poll(poll, poll_delay)
+
+    state_type = last_state.get("state_type")
+    finish(f"{expected_state_type}_selection_timeout", max_polls)
+    raise RuntimeError(
+        f"Timed out waiting for {expected_state_type} selection after {max_polls} polls; "
+        f"last state_type={state_type!r}"
+    )
 
 
 def wait_for_map_node_transition(
@@ -2032,12 +2216,13 @@ def execute_actions(
     wait_after_end_turn: bool,
     max_polls: int,
     poll_delay: float,
+    fast_action_waits: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     executed: list[dict[str, Any]] = []
     final_state: dict[str, Any] = {}
+    planned_actions = expand_action_macros(actions)
 
-    for raw_action in actions:
-        planned = normalize_action(raw_action)
+    for action_index, planned in enumerate(planned_actions):
         if planned.get("action") == "drain":
             final_state, drained = drain_trivial(
                 client,
@@ -2054,6 +2239,25 @@ def execute_actions(
                 client.endpoint = str(planned["_endpoint"])
             except Exception:
                 pass
+
+        if planned.get("_macro_confirm_state") is not None:
+            expected_state_type = str(planned["_macro_confirm_state"])
+            current = final_state if final_state else client.state()
+            if current.get("state_type") != expected_state_type:
+                executed.append(
+                    {
+                        "planned": planned,
+                        "skipped": True,
+                        "reason": f"{planned.get('_macro')} selection already resolved",
+                    }
+                )
+                final_state = current
+                continue
+            if not modal_can_confirm(current, expected_state_type):
+                raise RuntimeError(
+                    f"{planned.get('_macro')} cannot confirm because "
+                    f"{expected_state_type} is not confirmable"
+                )
 
         current_state = final_state if final_state else None
         body, state_before = action_body_from_plan(
@@ -2085,6 +2289,15 @@ def execute_actions(
             if body.get("action") == "play_card"
             else 0
         )
+        base_card_settle_polls = (
+            FAST_CARD_SETTLE_POLLS
+            if (
+                fast_action_waits
+                and action_index == len(planned_actions) - 1
+                and extra_card_settle_polls == 0
+            )
+            else READY_STATE_SETTLE_POLLS
+        )
         client.post(body)
         executed.append({"planned": planned, "body": body})
 
@@ -2097,6 +2310,7 @@ def execute_actions(
                 client,
                 state_before,
                 before_sig=before_sig,
+                base_settle_polls=base_card_settle_polls,
                 extra_settle_polls=extra_card_settle_polls,
                 logger=logger,
                 max_polls=max_polls,
@@ -2123,6 +2337,15 @@ def execute_actions(
             final_state = wait_for_map_node_transition(
                 client,
                 state_before,
+                logger=logger,
+                max_polls=max_polls,
+                poll_delay=poll_delay,
+            )
+        elif planned.get("_macro_select_state") is not None:
+            final_state = wait_for_modal_selection_result(
+                client,
+                state_before,
+                expected_state_type=str(planned["_macro_select_state"]),
                 logger=logger,
                 max_polls=max_polls,
                 poll_delay=poll_delay,
@@ -3040,6 +3263,14 @@ def build_parser() -> argparse.ArgumentParser:
     act.add_argument("--no-auto-target", action="store_true")
     act.add_argument("--drain", action="store_true", help="Run trivial drain after each action")
     act.add_argument("--no-wait-end-turn", action="store_true")
+    act.add_argument(
+        "--fast-action-waits",
+        action="store_true",
+        help=(
+            "Use shorter settle checks for simple in-combat card plays. "
+            "Delayed/draw/modal/end-turn waits remain conservative."
+        ),
+    )
     act.add_argument("--max-polls", type=int, default=DEFAULT_MAX_POLLS)
     act.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
     act.add_argument("--verbose", action="store_true")
@@ -3049,6 +3280,14 @@ def build_parser() -> argparse.ArgumentParser:
     cards.add_argument("--target", default=None, help="first, lowest_hp, highest_hp, entity id, or omitted for auto")
     cards.add_argument("--end-turn", action="store_true")
     cards.add_argument("--drain", action="store_true")
+    cards.add_argument(
+        "--fast-action-waits",
+        action="store_true",
+        help=(
+            "Use shorter settle checks for simple in-combat card plays. "
+            "Delayed/draw/modal/end-turn waits remain conservative."
+        ),
+    )
     cards.add_argument("--max-polls", type=int, default=DEFAULT_MAX_POLLS)
     cards.add_argument("--poll-delay", type=float, default=DEFAULT_POLL_DELAY)
     cards.add_argument("--verbose", action="store_true")
@@ -3129,6 +3368,7 @@ def run_start_metadata(args: argparse.Namespace, argv: list[str] | None, log_pat
         "max_polls": getattr(args, "max_polls", None),
         "max_steps": getattr(args, "max_steps", None),
         "drain": bool(getattr(args, "drain", False)),
+        "fast_action_waits": bool(getattr(args, "fast_action_waits", False)),
         "no_log": bool(args.no_log),
     }
 
@@ -3414,6 +3654,7 @@ def run(argv: list[str] | None = None) -> int:
                 auto_target=not args.no_auto_target,
                 drain_after=args.drain,
                 wait_after_end_turn=not args.no_wait_end_turn,
+                fast_action_waits=args.fast_action_waits,
                 max_polls=args.max_polls,
                 poll_delay=args.poll_delay,
             )
@@ -3445,6 +3686,7 @@ def run(argv: list[str] | None = None) -> int:
                 auto_target=True,
                 drain_after=args.drain,
                 wait_after_end_turn=True,
+                fast_action_waits=args.fast_action_waits,
                 max_polls=args.max_polls,
                 poll_delay=args.poll_delay,
             )

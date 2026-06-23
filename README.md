@@ -84,6 +84,7 @@ uv run --directory cli python sts2_fast_cli.py --compact map
 uv run --directory cli python sts2_fast_cli.py --compact start-run --character ironclad
 uv run --directory cli python sts2_fast_cli.py --compact menu main_menu
 uv run --directory cli python sts2_fast_cli.py --compact act '[{"play":"Shrug It Off+"},{"play":"Uppercut+","target":"first"},{"end_turn":true}]' --drain --max-polls 80
+uv run --directory cli python sts2_fast_cli.py --compact act '[{"hand_pick":1}]'
 uv run --directory cli python sts2_fast_cli.py analyze-log 'logs/sts2-fast/act2-fight-01*.jsonl'
 ```
 
@@ -109,7 +110,10 @@ server:
   game-over options through the old `menu_select` action.
 - `act`: execute a JSON action plan. It accepts ergonomic shorthands like
   `{"play":"Strike"}` and old MCP tool-name aliases like
-  `{"action":"rewards_claim","reward_index":0}`.
+  `{"action":"rewards_claim","reward_index":0}`. Use pick macros such as
+  `{"hand_pick":1}` or `{"deck_pick":4}` for one-decision select+confirm
+  modal screens, and `--fast-action-waits` when the final action in a command
+  is a simple card play that does not need a conservative post-action state.
 - `cards`: play card names in order, with optional `--target`, `--end-turn`,
   and `--drain`.
 - `drain`: resolve no-decision screens without model deliberation.

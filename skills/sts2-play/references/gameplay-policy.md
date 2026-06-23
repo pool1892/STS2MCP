@@ -6,6 +6,12 @@ Use this reference when making strategic and tactical choices during a run.
 
 - HP is a resource, but avoid preventable chip damage when it does not buy
   tempo, relic value, or lethal setup.
+- Inspect the whole current deck context before every card choice. This applies
+  to rewards, shops, upgrades, removals, transforms, enchantments, events,
+  start-of-combat generated choices, and tactical card-selection prompts. Use
+  the hand plus draw/discard/exhaust piles, retained/generated cards, relics,
+  powers, and the deck's active engine; never evaluate a card only from its
+  isolated text or generic strength.
 - Deck quality beats deck size. Skip cards that do not solve a current problem
   or strengthen a clear plan.
 - Front-loaded damage is the Act 1 baseline; Act 2 needs enough block, draw,
@@ -63,6 +69,10 @@ Use this reference when making strategic and tactical choices during a run.
 
 ## Card Reward Decisions
 
+Before deciding, inspect the whole deck context, not just the offered cards.
+Name the deck engine or current gap the choice serves. If the fit is unclear,
+skip by default.
+
 Prefer cards that improve one of these:
 
 - immediate damage
@@ -99,3 +109,11 @@ cards that do not swing a fight.
   status list as passive context: each turn adds 9 Strength and makes the next
   attack much harder to block. Prioritize Weak/Vulnerable and burst damage over
   slow powers unless the hand also covers the immediate attack.
+- Queen's `Chains of Binding` is a hard tactical constraint, not flavor text.
+  When only one Bound card can be played, choose the Bound card before planning
+  the rest of the turn. Do not assume a draw-heavy line remains legal after a
+  Bound play.
+- Against Queen, the minion can outscale the leader-race plan if left alive
+  while the player is Frail/Weak/Vulnerable. Continue prioritizing Queen as the
+  win condition, but treat the minion's Strength and attack intent as the
+  immediate survival clock every turn.

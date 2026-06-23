@@ -68,3 +68,39 @@ Purpose: prototype observations about whether the localhost API and fast CLI exp
 - Waiters now fail closed when a changed state never stabilizes before the poll budget expires. Returning an explicitly unsettled state was the same failure class as the original timing bug.
 - Combat readiness no longer depends on having a playable card. A real turn can have no playable actions, so readiness is now based on player turn/play phase plus an exposed hand list, with stability polls doing the transient filtering.
 - Regression coverage now includes the exact failure shapes: early combat before delayed modal, playable retained-card transient before full turn state, delayed `hand_select` after `Thinking Ahead`, partial modal frames after card play, late rewards after draw/auto effects, late rewards after confirming a hand-selection modal, and changed-but-never-stable timeout paths.
+
+## 2026-06-22 Act 3 Boss Loss Slice
+
+- Whole-deck rule worked for card choices: `Inflame+`, `Taunt`, and generated
+  `Inflame` were chosen because they fit the actual Strike/Vulnerable/Vicious
+  boss plan, not because of isolated card strength.
+- Modal macros worked in live play: `card_select_pick` resolved Choices Paradox
+  choices and skipped confirmation when selection immediately exited the modal;
+  `deck_pick` and `hand_pick` had already been exercised earlier in the run.
+- `--fast-action-waits` exposed a real safety boundary before this boss slice:
+  when used too broadly in a multi-card batch, a stale hand/index frame caused
+  an intended follow-up play to resolve to the wrong card. The CLI fix now keeps
+  intermediate card plays conservative and only permits fast waits on the final
+  simple card play in a command.
+- Queen loss root cause was gameplay, not a CLI failure: the state exposed
+  `Chains of Binding`, Frail, Weak, Vulnerable, minion Strength, and the minion
+  attack intents clearly. The planner underweighted how rapidly the minion's
+  Strength would make the leader-race plan untenable.
+- Bound should be handled as a turn-shaping constraint before card ordering.
+  In Queen, the first three drawn cards were often Bound, and only one Bound
+  card could be played. Planning "draw into block" or "play the damage card
+  after setup" was invalid unless the selected Bound card had already been
+  fixed.
+- Raw `draw_pile` remains useful for context but not deterministic enough for
+  exact follow-up planning after shuffles, triggered draws, or Vicious draws.
+  The floor 48 boss turn showed displayed raw order suggesting Defends, while
+  Vicious actually drew Ashen Strike and Thinking Ahead. The correct loop is to
+  stop after draw-changing actions and re-read state unless every possible draw
+  leaves the same action correct.
+- Howl from Beyond text is still not sufficient for timing assumptions. It did
+  not replay before enemy attacks in the hallway fight where the planner
+  expected end-of-turn lethal, causing a large preventable hit. Treat unusual
+  delayed card text as "needs observation" until verified in the current build.
+- The CLI's fail-closed behavior prevented compounding one bad draw assumption:
+  a batch that expected Defends stopped when `Defend` was absent, preserving
+  the actual mid-turn state for recovery.

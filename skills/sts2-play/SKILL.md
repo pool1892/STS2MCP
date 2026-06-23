@@ -91,6 +91,13 @@ Execute a fused deterministic turn plan:
 uv run --directory cli python sts2_fast_cli.py --compact act '[{"play":"Shrug It Off+"},{"play":"Uppercut+","target":"first"},{"end_turn":true}]' --drain --max-polls 80
 ```
 
+For deterministic commands whose final action is a simple card play and whose
+next decision does not depend on a conservative post-action state, add
+`--fast-action-waits`.
+For one-decision modal selections, prefer `hand_pick`, `deck_pick`,
+`card_select_pick`, or `bundle_pick` so selection and confirmation stay inside
+one CLI command.
+
 Pin a log path for a measured slice:
 
 ```fish
@@ -116,6 +123,9 @@ uv run --directory cli python sts2_fast_cli.py --compact wiki "perfected strike"
 1. Read state.
 2. Drain no-decision states with the CLI without model deliberation.
 3. If a real decision remains, reason from the current state and policy notes.
+   For any card-choice decision, read the whole deck context first. Use raw
+   state when compact output does not expose the full hand plus draw, discard,
+   and exhaust piles.
 4. Send the smallest safe batch of deterministic CLI actions.
 5. Let the CLI poll until the next ready state.
 6. Record decisions, mistakes, timing pain, and new automation candidates.
